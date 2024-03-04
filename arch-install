@@ -1284,8 +1284,8 @@ ESP_DIR=\"${efi}/EFI/Linux\"
 
 ALL_config=\"/etc/mkinitcpio.conf\"
 ALL_kver=\"/boot/vmlinuz-${KERNEL[0]}\"" >> "$preset"
-    [[ -e /boot/amd-ucode.img ]] && echo "ALL_microcode=\"/boot/amd-ucode.img\"" >> "$preset"
-    [[ -e /boot/intel-ucode.img ]] && echo "ALL_microcode=\"/boot/intel-ucode.img\"" >> "$preset"
+    [[ -e /boot/amd-ucode.img ]] && echo "microcode=\"/boot/amd-ucode.img\"" >> "$preset"
+    [[ -e /boot/intel-ucode.img ]] && echo "microcode=\"/boot/intel-ucode.img\"" >> "$preset"
     echo \
 "#[[ -e /boot/amd-ucode.img ]] && cp -af /boot/amd-ucode.img \"\${ESP_DIR}/\"
 #[[ -e /boot/intel-ucode.img ]] && cp -af /boot/intel-ucode.img \"\${ESP_DIR}/\"
