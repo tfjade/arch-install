@@ -1,0 +1,3043 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1090,SC2015,SC2018
+#
+# arch-install by tfjade@protonmail.com
+#
+[[ -f /etc/arch-release ]] || { echo "This Arch Linux installer must be run on Arch Linux."; exit 1; }
+(( EUID == 0 )) || { echo "Only root can run this Arch Linux installer."; exit 1; }
+
+###############################################################################
+
+# On EFI system, where to mount the EFI esp, /boot, /boot/efi or /efi?
+# If Grub with encryption, a separate boot partition is created for /boot,
+# if the EFI esp is something else than /boot
+EFI="/boot/efi"
+
+# If encryption is selected, default luks2 encryption volume name is "cryptvol".
+# You may change this according to taste. It could be e.g. "cryptroot"
+CRYPTVOL_NAME="cryptvol"
+
+# Some partition UUIDs according to The Discoverable Partition Specification
+# DO NOT CHANGE THESE without a valid reason
+GUID_ESP="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+GUID_BOOT="bc13c2ff-59e6-4262-a352-b275fd6f7172"
+GUID_ROOT="4f68bce3-e8cd-4db1-96e7-fbcaf984b709"
+GUID_HOME="933ac7e1-2eb4-4f13-b844-0e14e2aef915"
+GUID_SWAP="0657fd6d-a4ab-43c4-84e5-0933c84b4f4f"
+
+###############################################################################
+
+# debug helper
+debug_echo() {
+   >&2 echo "$@"
+}
+
+# Usage: freespace [scale] device
+# Show amount of free space on device in bytes by default.
+# Optional scale can be (case-insensitive) -k, -M or -G to scale the output to
+# kiB, MiB or GiB.
+# If device is a disk, output unpartitioned space i.e. free space for
+# new partitions.
+# If device contains a filesystem, output free space in the filesystem,
+# else output the size of the device.
+freespace() {
+  local target type fs scale=1
+  while [[ $1 ]]; do
+    case "$1" in
+      -K|-k)
+          scale=$((2**10)) ;;
+      -M|-m)
+          scale=$((2**20)) ;;
+      -G|-g)
+          scale=$((2**30)) ;;
+          *)
+          [[ -b $1 ]] && target="$1" ;;
+    esac
+    shift
+  done
+  [[ -b $target ]] || return 1
+  type=$(lsblk -no type "$target" | sort | head -1)
+  [[ $type == disk ]] && fs="$(lsblk -nbo size "$target" | awk 'NR==1 {sz=$1} NR>1 {sz-=$1} END {print int(sz)}')"
+  [[ $type != disk ]] && [[ $(lsblk -no fstype "$target" | head -1) ]] && fs="$(lsblk -nbo fsavail "$target" | head -1)"
+  [[ $fs ]] || fs="$(lsblk -nbo size "$target" | head -1)"
+  printf '%d' "$((fs / scale))"
+}
+
+# Select the target install disk
+# Sets: DISK - the selected install target disk
+select_disk() {
+  local disklist d
+  readarray -t disklist <<<"$(lsblk -dno type,path | awk '$1=="disk" && !($2 ~ /loop|zram/) {print $2}' | sort)"
+  if [[ $YES ]] && (( ${#disklist[@]} == 1 )); then
+      #  < 1: show list of disks, if the list contains at least one disk
+      # == 1: Only one disk found, it must be the target.
+      # Note: if the disk contains partitions (i.e. data), later you can
+      # decide, what to do with the existing partitions or volumes.
+      DISK="${disklist[0]}"
+  elif (( ${#disklist[@]} >= 1 )); then
+      echo -e "\n--- Disk devices ---"
+      for d in "${disklist[@]}"; do fdisk -l "$d"; echo; done | less -FX
+      echo -e "\e[1;33m**** All data on the selected target disk may be destroyed! ****\e[0m"
+      DISK=""
+      until [[ $DISK ]]; do
+          echo -e "\nSelect target disk for this installation (0 to abort)\n"
+          PS3='Select disk #:'; select DISK in "${disklist[@]}"; do ((REPLY > ${#disklist[@]})) && echo -e "\nInvalid selection ($REPLY)"; break; done
+          unset PS3
+          ((REPLY == 0)) && break
+      done
+  fi
+  [[ -b "$DISK" ]] && return 0
+  [[ -b "/dev/$DISK" ]] && DISK="/dev/$DISK" || { echo "No disk selected, aborting install."; exit 1; }
+}
+
+# Is this an efi system? Efi system needs an esp.
+is_efi() {
+    [[ -d /sys/firmware/efi/efivars ]]
+}
+
+# detect_esp [$1]
+# $1 : optional, the target device where to search. If omitted, search on $DISK
+# Detect esp on the target disk.
+# Sets ESP if an esp is present.
+# The esp MUST HAVE partuuid c12a7328-f81f-11d2-ba4b-00a0c93ec93b (i.e. $GUID_ESP)
+detect_esp() {
+    local target
+    target="$DISK"
+    while [[ $1 ]]; do
+        [[ -b "$1" ]] && target="$1"
+        shift
+    done
+    [[ -b "$target" ]] || return 2
+    ESP="$(blkid -s PARTUUID | grep -i "${target}.*${GUID_ESP}" | cut -d: -f1)"
+    #[[ $ESP ]] || ESP=$(blkid -s TYPE -s LABEL | grep "${target}.*vfat" | grep -Ei '(EFI|BOOT)' | cut -d: -f1)
+    [[ $ESP ]] && return 0
+    return 1
+}
+
+# esp_size [$1]
+# output the size of the EFI esp scaled to $1.
+# $1 can be -k|-K, -m|-M or -g|-G for kiB, MiB or GiB respectively.
+# If no $1 is given, the returned size will be unscaled.
+# The ESP variable must be set, e.g. run detect_esp before calling this.
+esp_size() {
+    local scale=1
+    while [[ $1 ]]; do
+        case "$1" in
+            -k|-K)
+                scale=1024 ;;
+            -m|-M)
+                scale="$((2**20))" ;;
+            -g|-G)
+                scale="$((2**30))" ;;
+        esac
+        shift
+    done
+    [[ -b "$ESP" ]] && printf '%d' "$(( $(lsblk -nbo size "$ESP") / scale ))" && return 0
+    return 1
+}
+
+# detect_boot [$1]
+# $1 : optional, the target device where to search. If omitted, search on $DISK
+# Detect possible BOOT-partition. Always use detect_esp first!
+# Sets BOOTP if a BOOT-partition is present.
+detect_boot() {
+    local target wipe=""
+    target="$DISK"
+    while [[ "$1" ]]; do [[ $1 == "--wipe" ]] && wipe=yes; shift; done
+    [[ -b "$target" ]] || return 2
+    BOOTP="$(blkid -s PARTUUID | grep -i "${target}.*${GUID_BOOT}" | cut -d: -f1)"
+    [[ $BOOTP ]] || BOOTP="$(blkid -s LABEL | grep -i "${target}.*BOOT" | cut -d: -f1)"
+    [[ $BOOTP ]] && [[ $BOOTP == "$ESP" ]] && is_efi && BOOTP=""
+    if [[ $BOOTP && "$wipe" ]]; then
+        mount | grep -qF "$BOOTP" && umount "$BOOTP"
+        wipefs -aq "$BOOTP" && echo "Wiped boot partition $BOOTP" || echo "Failed wiping boot partition $BOOTP"
+    fi
+    [[ $BOOTP ]] && return 0 || return 1
+}
+
+# Detect possible root partition.
+# Detects and outputs the UUID of the root partition/volume. Note that if root is on unencrypted LVM,
+# this is the UUID of the root volume.
+detect_root() {
+    local uuid quiet=""
+    while [[ $1 ]]; do
+      case "$1" in
+        -q|--quiet) 
+            quiet="yes"; shift;;
+        *) 
+            shift;;
+      esac
+    done
+    uuid="$(blkid -t PARTUUID="$GUID_ROOT" -s UUID -o value)"
+    [[ $uuid ]] && [[ $(blkid -t UUID="$uuid" -s TYPE -o value) == LVM2_member ]] && uuid=""
+    [[ $uuid ]] || uuid="$(blkid -t TYPE=crypto_LUKS -s UUID -o value)"
+    [[ $uuid ]] || uuid="$(blkid -t LABEL=root -s UUID -o value)"
+    [[ $uuid ]] || uuid="$(blkid -t LABEL=ROOT -s UUID -o value)"
+    [[ $quiet ]] || printf '%s' "$uuid"
+    [[ $uuid ]] && return 0 || return 1
+}
+
+# Detect systemd-homed created homes.
+# Not universal detection! Works only with schemes created by this installer. 
+detect_systemd-homed() {
+    local lsb quiet s p h i
+    while [[ $1 ]]; do
+        case "$1" in
+          -q|--quiet) 
+              quiet=yes ;;
+        esac
+        shift
+    done
+    findmnt -n /mnt &>/dev/null && umount -R /mnt
+    lsb="$(lsblk -no path,type,label,fstype "$DISK")"
+    for opt in lvm crypt part; do
+
+        # find dev path
+        s="$(grep -w "$opt" <<< "$lsb")"
+        case "$opt" in
+         lvm) 
+            s="$(grep -wi root <<< "$s")"
+            ;;
+         part)
+            s="$(grep -vw 'vfat$' <<< "$s" | grep -vwi home)"
+            ;;
+        esac
+        [[ $s ]] || continue
+        p="${s%% *}"
+
+        # mount the found path
+        if [[ $s =~ btrfs$ ]]; then
+            findmnt -n /mnt &>/dev/null || mount -o subvol=@ "$p" /mnt
+            btrfs su list /mnt | grep -qw '@home$' && { findmnt -n /mnt/home &>/dev/null || mount -o subvol=@home "$p" /mnt/home; }
+        else
+            findmnt -n /mnt &>/dev/null || mount "$p" /mnt
+        fi
+
+        # search for systemd-homed homes
+        case "$opt" in
+          crypt)
+            [[ $s =~ btrfs$ ]] && mapfile -t h < <(btrfs su list /mnt | awk '/\.homedir/ {print $NF}')
+            [[ $s =~ ext4$ ]] && mapfile -t h < <(find /mnt/home -mindepth 1 -name "*.homedir")
+            ;;
+          lvm|part)
+            mapfile -t h < <(find /mnt/home -mindepth 1 -name "*.home*")
+            ;;
+        esac
+        (( ${#h[*]} > 0 )) && break
+    done
+    findmnt -n /mnt &>/dev/null && umount -R /mnt
+    (( ${#h[*]} > 0 )) && for i in "${h[@]}"; do
+        i="${i##*/}"; i="${i%dir}"; i="${i%.home}"
+        [[ $quiet ]] || printf '%s ' "$i"
+    done && { [[ $quiet ]] || echo -en "\b"; } && return 0
+    return 1
+}
+
+# Detect if separate home partition.
+# Outputs the "found" home, returns true/false whether a home was found or not.
+# If HOME_PARTITION is set to an existing device path, this is the "found" home.
+detect_home() {
+    local found_HOME quiet=""
+    while [[ $1 ]]; do
+      case "$1" in
+        -q|--quiet)
+            quiet="yes"; shift;;
+        *)
+            shift;;
+      esac
+    done
+    
+    # found_HOME is HOME_PARTITION if it is specified and it exists as a block device
+    [[ -b $HOME_PARTITION ]] && found_HOME="$HOME_PARTITION"
+
+    # or found_HOME is mounted at /home and it isn't the btrfs subvolume @home
+    [[ $found_HOME ]] || found_HOME="$(mount | awk '/\/home\s/ {if (!index($NF,"@")) print $1}')"
+
+    # or found_HOME has GUID GUID_HOME
+    [[ $found_HOME ]] || found_HOME="$(blkid -t PARTUUID="$GUID_HOME" | cut -d: -f1)"
+
+    # or found_HOME has label "home" (case insensitive)
+    [[ $found_HOME ]] || found_HOME="$(blkid -s LABEL | grep -i 'home' | cut -d: -f1)"
+
+    [[ $quiet ]] || printf '%s' "$found_HOME"
+    [[ $found_HOME ]] && return 0 || return 1
+}
+
+detect_lvm() {
+    local target quiet=""
+    while [[ "$1" ]]; do
+        case "$1" in
+          -q|--quiet)
+              quiet=yes ;;
+          *)
+              [[ -b "$1" ]] && target="$1" ;;
+        esac
+        shift
+    done 
+    [[ $target ]] || target="${VGPART:-$DISK}"
+    command -v pvs &> /dev/null || return 1
+    target=$(pvs | awk "\$1 ~ \"${target}\" {print \$2}")
+    [[ $quiet ]] || printf '%s' "$target"
+    [[ $target ]] && return 0 || return 1
+}
+
+# Detects if there is a filesystem on block device $1
+# If an optional fs type is given as an argument, checks whether 
+# the detected fstype matches the argument.
+# Outputs the detected fstype, unless -q or --quiet is an argument.
+detect_fs() {
+    local target quiet="" fs="" fstype
+    while [[ $1 ]]; do
+        case "$1" in
+          -q|--quiet)
+              quiet=yes ;;
+          ext2|ext3|ext4|vfat|btrfs|xfs|f2fs|ntfs)
+              fs="$1" ;;
+          *)
+              target="$1" ;;
+        esac
+        shift
+    done
+    [[ $target =~ ^/dev/ ]] || target=/dev/"${target#/}"
+    if [[ -b "$target" ]]; then
+        fstype="$(blkid -s TYPE -o value "$target")"
+        [[ -z "$quiet" ]] && [[ $fstype ]] && printf '%s' "$fstype"
+        [[ $fs ]] && [[ $fs == "$fstype" ]] && return 0
+        [[ -z "$fs" ]] && [[ $fstype ]] && return 0
+    fi
+    return 1
+}
+
+# Detects if the optional $1 (block device or a directory path) is btrfs.
+# If $1 is a path, it should be an active mountpoint.
+# If no argument, detects if the root (/) is btrfs.
+detect_btrfs() {
+    local target
+    target="${1:-"/"}"
+    # If target is a block device
+    # shellcheck disable=SC2046  # return value must be numerical, not string
+    [[ -b "$target" ]] && return $(detect_fs -q btrfs "$target")
+        # If target is a mountpoint path
+    [[ $(findmnt -no FSTYPE "$target") == btrfs ]] && return 0
+    return 1
+}
+
+# Detects if rootfs is btrfs and whether the default subvolume id is set or not.
+# Return 0 (success) only if the btrfs default subvolume id is set.
+# Outputs the id unless -q or --quiet is an argument.
+detect_btrfs_default_id() {
+    local id
+    detect_btrfs && id="$(btrfs subvol get-default / | awk '$1 == "ID" {print $2}')" || return 1
+    [[ $1 == "-q" || $1 == "--quiet" ]] || printf '%s' "$id"
+    (( id == 5 )) && return 2 || return 0
+}
+
+# If btrfs, output the root subvolume name. If root is not btrfs, output is empty.
+btrfs_root_subvol() {
+    local target
+    is_chroot && target="/" || target="/mnt"
+    findmnt -nt btrfs "$target" | awk -F= '{print substr($NF,2)}'
+}
+
+# Detects weather $1 is a ssd i.e. a non-rotational disk device.
+# $1 can be either a device path like "/dev/sdb" or just "sdb"
+# In virtual machines apparently the disk is always rotational i.e. NOT ssd.
+# That's why there is VM_IS_ALWAYS_SSD.
+detect_ssd() {
+    [[ $VM_IS_ALWAYS_SSD ]] && systemd-detect-virt -q && return 0
+    [[ -b "$1" || -b /dev/"$1" ]] && [[ -e /sys/block/"${1##*/}"/queue/rotational ]] || return 1
+    return "$(head -c 1 /sys/block/"${1##*/}"/queue/rotational)"
+}
+
+# read_pkglist [-q|--quiet] source
+#       source    Filename of the source file containing the names of the packages
+#                 to install.
+#                 Source file should contain only package names and comments (#).
+#                 Every uncommented "word" is assumed to be a package name. 
+#                 Package names can be many on one line, or one per line, 
+#                 i.e. the file may have multiple lines.
+#                 
+#       -q, --quiet
+#                 Unless either is given as option, outputs the packages to STDOUT. 
+# Sets: PKGLIST   Array containing the list of packages, or empty array.
+read_pkglist() {
+    local source quiet
+    while [[ $1 ]]; do
+      case "$1" in
+        -q|--quiet)
+            quiet=yes; shift;;
+        --)
+            shift;&
+        *) 
+            [[ -e "$1" ]] && source="$1" && break || shift;;
+      esac
+    done
+    PKGLIST=() # initialize list as empty
+    [[ $source ]] && readarray -t PKGLIST <<<"$(sed -n 's/^\s*//;s/\s*#.*//;s/\s/\n/g;/^\w/p' "$source")"
+    [[ $quiet ]] || echo "${PKGLIST[@]}"
+}
+
+# in_list list ... -- item ...
+# The -- is the separator between list(s) and item(s).
+# Both lists and items are all space separated words.
+# That means "a b c" is equal to "a" "b" "c".
+# Return true, if any of items is found in lists.
+# Return false, if no matches were found.
+in_list() {
+    local tmp array list items li i n
+    list=()
+    items=()
+    n=$#
+    array=list
+    while ((n)); do
+        [[ $1 == "--" ]] && array= && shift && ((n--)) && continue
+        read -ra tmp <<< "$1"
+        [[ $array == list ]] && list+=("${tmp[@]}") || items+=("${tmp[@]}")
+        shift
+        ((n--))
+    done
+    for li in "${list[@]}"; do
+        for i in "${items[@]}"; do
+            [[ $li == "$i" ]] && return 0
+        done
+    done
+    return 1
+}
+
+# Usage: parent [-q|--quiet] dev
+# Outputs the parent of block device dev, unless -q or --quiet is an option.
+# Returns true if parent is found, false if not i.e. dev is a disk
+parent() {
+    local n dev p quiet
+    while [[ $1 ]]; do
+        case "$1" in
+            -q|--quiet) 
+              quiet=yes ;;
+            *)
+              dev="$1" ;;
+        esac
+        shift
+    done
+    [[ ${dev:0:1} == '/' ]] || dev=/"$dev"
+    n=$(awk -F/ '{print NF-1}' <<< "$dev")
+    (( n == 1 )) && dev=/dev"$dev" && n=2
+    if (( n == 2 )); then
+        # partition?
+        p="$dev"; while [[ $p =~ [0-9]$ ]]; do p=${p:0:$((${#p}-1))}; done; [[ ! -b "$p" ]] && p=${p%p}
+        [[ $p == "$dev" || ! -b "$p" ]] && unset p
+
+        # lvm? vg names like /dev/volgroup1
+        [[ $p ]] || p="$(pvs --noheadings | awk -v vg="${dev##*/}" '$2==vg {print $1}')"
+
+        # cryptvols are like /dev/mapper/cryptvol i.e. n == 3
+        # None of the above means it has no parent, i.e. it's a disk
+    elif (( n == 3 )) && [[ $dev =~ ^/dev/ ]]; then
+        # like /dev/mapper/... or /dev/volgroup1/...
+        p="$(find /sys/block/"$(stat -c %N "$dev" | grep -o 'dm-[0-9]*')"/slaves -mindepth 1)"
+        p=${p##*/}
+        [[ $p =~ ^dm-[0-9]+$ ]] && p="$(stat -c %N /dev/mapper/* | grep -Fw "$p" | cut -d' ' -f1 | tr -d \')" || p=/dev/"$p"
+    fi
+    [[ -b "$p" ]] && { [[ $quiet ]] || printf '%s' "$p"; } && return 0
+    return 1
+}
+
+# helper
+# is $1 saved?
+is_saved() {
+    in_list "${SAVE_PARTS[*]}" -- "$1"
+}
+
+# helper
+# Save $1 unless already saved
+save_part() {
+    is_saved "$1" || SAVE_PARTS+=("$1")
+}
+
+# helper
+# remove from saved
+remove_saved() {
+    local t
+    is_saved "$1" && t=("${SAVE_PARTS[@]}") && t=("${t[@]/"$1"/}") && SAVE_PARTS=("${t[@]}")
+}
+# Usage: save_with_parents dev [...]
+# Save one or more dev's and its/their parents up to the disk device.
+# E.g. to save a partition, you have to save the whole "tree" above it.
+save_with_parents() {
+    local tp
+    while [[ $1 ]]; do
+        tp="$1"
+        shift
+        while [[ $tp ]]; do
+            save_part "$tp"
+            tp="$(parent "$tp")"
+        done
+    done
+}
+
+# Usage: dev_on_disk dev
+# Outputs on which disk dev is.
+dev_on_disk() {
+    local tp
+
+    tp=$1
+    while [[ $tp ]]; do
+        ! parent -q "$tp" && printf '%s' "$tp" && return 0
+        tp="$(parent "$tp")"
+    done
+    return 1
+}
+
+# Return the bigger of $1 and $2. 
+# Comparison is taking into account the scale (k,M,G,T) like 1G > 512M, 2m > 500k, and so on.
+# Warning! Not very robust against poorly formatted inputs! 
+max() {
+    local a b ascale bscale
+   [[ $1 ]] && a="$1" || return 1
+   case ${a: -1} in
+        k|K)
+            ascale="2**10" ;;
+        m|M)
+            ascale="2**20" ;;
+        g|G)
+            ascale="2**30" ;;
+        t|T)
+            ascale="2**40" ;;
+        *)
+            ascale=1;;
+    esac
+    while ! [[ $a =~ [0-9]$ ]]; do a="${a:0:$((${#a}-1))}"; done
+    [[ $2 ]] && b="$2" || { printf '%s' "$1"; return 1; }
+    case ${b: -1} in
+        k|K)
+            bscale="2**10" ;;
+        m|M)
+            bscale="2**20" ;;
+        g|G)
+            bscale="2**30" ;;
+        t|T)
+            bscale="2**40" ;;
+        *)
+            bscale=1 ;;
+    esac
+    while ! [[ $b =~ [0-9]$ ]]; do b="${b:0:$((${#b}-1))}"; done
+    ((${a:-0}*ascale >= ${b:-0}*bscale)) && printf '%s' "$1" || printf '%s' "$2"
+}
+
+# some gpt partititon types:
+#EFI_esp=ef00
+#XBOOTLDR=ea00
+#Swap=8200
+#Linux=8300
+#Linux_LVM=8e00
+#Solaris_ZFS=bf01
+#Windows=8700
+
+
+# create_partitions_efi [-i #p] [-p] disk
+#       -i #p  - Next free partition number #p.
+#       -p     - Nvme and mmc disks have an 'p' before partition number.
+#       disk   - disk device on an EFI system.
+# Sets: ESP    - the esp, unless already set
+#       BOOTP  - the /boot partition (only if EFI is not /boot and encryption is being used with Grub)
+#       VGPART - the space for encrypted vol, LVM vols, or the root partition
+create_partitions_efi() {
+    local disk p efisize ptype vgsize i=1
+    is_efi || return 1
+    while [[ $1 ]]; do
+        case "$1" in
+        -i) 
+            [[ $2 =~ ^[0-9]+$ ]] && i="$2" && shift;;
+        -p) 
+            p="p" ;;
+        *)
+            [[ -b "$1" ]] && lsblk -no type,path "$1" | grep -q "disk *$1" && disk="$1" ;;
+        esac
+        shift
+    done
+    [[ -b "$disk" ]] || return 1
+
+    echo "EFI system"
+    # Create esp unless one exists. MUST include -u$i:$GUID_ESP because this script depends on it later.
+    # If EFI is not /boot and bootloader not Grub, the esp size is 256M * the number of kernels
+    # installed, or at least 320M.
+    [[ $EFI != /boot ]] && [[ ${BOOT_LOADER,,} != grub* ]] && efisize=$((256 * ${#KERNEL[@]}))M
+    efisize=$(max 320M "$efisize")
+    if [[ ! -b "$ESP" ]] && ! [[ $(detect_esp --) && $ESP == "$disk"* ]]; then
+        sgdisk --set-alignment=$((2**20/${SECTOR_SIZE:-512})) -n"$i"::+"$efisize" -t"$i":ef00 -u"$i":"$GUID_ESP" "$disk" && ESP="${disk}${p}$((i++))"
+    fi
+
+    if [[ -n $ENCRYPT && ${BOOT_LOADER,,} == grub* && $EFI != /boot ]]; then
+        # create 512M /boot partition, unless one already exists
+        detect_boot -- || { sgdisk -n"$i"::+512M -t"$i":ea00 -u"$i":"$GUID_BOOT" "$disk" && BOOTP="${disk}${p}${i}"; }
+        (( i++ ))
+    fi
+    # Create root partition, or a partition for the LVM volume group
+    ptype="8304"
+    if  [[ $SWAP_PARTITION && $SWAP_SIZE -ge 1 ]] || [[ $HOME_PARTITION && ! -b "$HOME_PARTITION" ]]; then
+        # LVM
+        ptype="8e00"
+    fi
+    if [[ $root_u == '%' ]]; then
+        # Converting ROOT_SIZE from "% of free space" to "size in GiB"
+        ROOT_SIZE=$(( $(lsblk -nbo size "$disk" | awk 'NR==1 {s=$1} NR>1 {s-=$1} END {print s}') * ROOT_SIZE / 100 / 2**30 + 1))
+        root_u=G
+    fi
+
+    if [[ $ROOT_SIZE -ge 1 ]] && [[ -z "$HOME_PARTITION" || -b "$HOME_PARTITION" ]]; then
+        # ROOT_SIZE is set, but not new HOME_PARTITION. Assuming ROOT_SIZE is in GiB.
+        if [[ $SWAP_PARTITION && $SWAP_SIZE -ge 1 ]]; then
+            case ${swap_u^} in
+                G)
+                    vgsize=$((ROOT_SIZE+SWAP_SIZE)) ;;
+                M)
+                    vgsize=$((ROOT_SIZE*2**10+SWAP_SIZE)) ;;
+                K)
+                    vgsize=$((ROOT_SIZE*2**20+SWAP_SIZE)) ;;
+            esac
+            (( vgsize <= $(freespace "$disk" "$swap_u") )) && vgsize="+${vgsize}${swap_u}"
+        else
+            (( ROOT_SIZE <= $(freespace "$disk" G) )) && vgsize="+${ROOT_SIZE}G"
+        fi
+        is_saved "${disk}${p}${i}" || [[ ${vgsize:0:1} == '+' ]] || { echo -e "\e[1;41m Error \e[0m Not enough free space on $disk.\nCheck output of 'lsblk' and settings in $_CONF"; exit 1; }
+    elif [[ -b "$HOME_PARTITION" ]]; then
+        # Home partition is some existing partition
+        [[ $ROOT_SIZE ]] && vgsize="+${ROOT_SIZE}G" || vgsize=""
+    else
+        vgsize=""
+    fi
+    is_saved "${disk}${p}${i}" || { sgdisk -n"$i"::"$vgsize" -t"$i":"$ptype" -u"$i":"$GUID_ROOT" "$disk" && VGPART="${disk}${p}${i}"; }
+    UUID="$(blkid -s UUID -o value "${disk}${p}${i}")"; ((i++))
+}
+
+# create_partitions_mbr [-i #p] [-p] disk
+#       -i #p   - Next free partition number #p.
+#       -p      - Nvme and mmc disks have an 'p' before partition number.
+#       disk    - disk device on a mbr system.
+# Sets: BOOTP   - the /boot (if encryption, or optional)
+#       VGPART  - the space for encrypted vol, LVM vols, or the root partition
+#       BOOT_LOADER - grub, since rEFInd and systemd-boot are for EFI systems only
+# Clears: ESP
+create_partitions_mbr() {
+    local disk p pn bootflag ptype i=1 
+    is_efi && return 1 # is an EFI system
+    while [[ $1 ]]; do
+        case "$1" in
+        -i)
+            [[ $2 =~ ^[0-9]+$ ]] && i="$2" && shift;;
+        -p)
+            p="p" ;;
+        *)
+            [[ -b "$1" ]] && lsblk -no type,path "$1" | grep -q "disk *$1" && disk="$1" ;;
+        esac
+        shift
+    done
+    [[ -b "$disk" ]] || return 1
+
+    echo "MBR system"
+    ((i > 1)) && pn=(-N "$i") || pn=(-a)
+    bootflag="bootable, "
+    ptype="linux"    
+    if [[ $ENCRYPT ]]; then
+        [[ $BOOTP ]] || { echo -e "${bootflag}type=${ptype}, size=320M" | sfdisk "${pn[@]}" "$disk" && BOOTP="${disk}${p}${i}"; }
+        pn=(-N "$((++i))")
+        bootflag=""
+    fi
+    if [[ $root_u == '%' ]]; then
+        # Convert ROOT_SIZE from "% of free space" to "size in GiB"
+        ROOT_SIZE=$(($(lsblk -nbo size "$disk"|awk 'NR==1 {s=$1} NR>1 {s-=$1} END {print s}') * ROOT_SIZE / 100 / 2**30 + 1))
+        root_u=G
+    fi
+    if  [[ $SWAP_PARTITION && $SWAP_SIZE -ge 1 ]] || [[ $HOME_PARTITION || $ROOT_SIZE -ge 1 ]]; then
+        ptype="lvm"
+    fi
+    is_saved "${disk}${p}${i}" || { echo -e "${bootflag}type=${ptype}, size=${ROOT_SIZE:-+}${root_u}" | sfdisk "${pn[@]}" "$disk" && VGPART="${disk}${p}${i}"; }
+    UUID="$(blkid -s UUID -o value "${disk}${p}${i}")"; ((i++))
+    [[ $BOOT_LOADER == grub* ]] || BOOT_LOADER=grub
+    unset ESP
+    # EFISTUB, rEFInd and systemd-boot support EFI systems only
+}
+
+create_partitions() {
+    local disk lbl opt
+    disk="$1"
+    [[ -b "$disk" ]] || return 1
+    i="$(lsblk -no path,type "$disk" | grep -cw part)"
+    if ((i == 0)); then
+        is_efi && lbl="gpt" || lbl="dos"
+        echo "label: $lbl" | sfdisk "$disk"
+        partprobe "$disk"
+        i=1
+    else
+        i="$(lsblk -no type,path "$disk" | awk '$1=="part" {p=gensub(/.*[^0-9]/,"","g",$2)} END {print p+1}')"
+    fi
+    opt=(-i "$i")
+    [[ $disk =~ /(nvme|mmc) ]] && opt+=(-p)
+    if is_efi; then
+        create_partitions_efi "${opt[@]}" "$disk" || { debug_echo "Error! EFI partition creation failed"; exit 1; }
+    else
+        create_partitions_mbr "${opt[@]}" "$disk" || { debug_echo "Error! MBR partition creation failed"; exit 1; }
+    fi
+}
+
+# open_encrypted_disk $1 [$2]
+# where $1 is an encrypted block device, and optionally $2 can be a name for the opened volume.
+# Returns 0 on success, 1 on failure (bash true and false)
+# Sets: CRYPTVOL_NAME - the name of the opened volume
+#       VGPART        - the opened volume /dev/mapper/$CRYPTVOL_NAME
+open_encrypted_disk() {
+    local opt
+    if [[ -b $1 ]] && cryptsetup isLuks "$1"; then
+       CRYPTVOL_NAME="${2:-$CRYPTVOL_NAME}"
+       if ! [[ -e "/dev/mapper/$CRYPTVOL_NAME" ]]; then
+          echo -e "\nNeed to\e[1;33m open the encrypted disk\e[0m to continue the installation."
+          detect_ssd "$DISK" && opt=(--perf-no_read_workqueue --perf-no_write_workqueue --allow-discards --persistent) || opt=()
+          cryptsetup "${opt[@]}" open "$1" "$CRYPTVOL_NAME" && VGPART="/dev/mapper/$CRYPTVOL_NAME" ||
+            { echo -e "\e[1;41m Error \e[0m Cannot open encrypted $1 as $CRYPTVOL_NAME"; exit 1; }
+          save_with_parents "$VGPART"
+          ENCRYPT=yes
+          return 0
+       fi
+    fi
+    return 1
+}
+
+
+# encrypt_disk [-s sec_size] dev
+# where dev is the block device to encrypt, and optionally -s sec_size is
+# the sector size of the disk. Valid sec_sizes are the powers of two 
+# between 512 and 4096 i.e. 512, 1024, 2048 and 4096. Increasing sector size
+# from the default 512 to 4096 can provide better performance on modern
+# hardware, see: man cryptsetup-create.
+# If encryption fails, clear ENCRYPT flag.
+# Returns 0 on success, 1 on failure (bash true and false)
+encrypt_disk() {
+    local dev sec_size=512
+    while [[ $1 ]]; do
+        case "$1" in
+            -s) 
+                in_list 512 1024 2048 4096 -- "$2" && sec_size="$2" && shift;;
+             *)
+                dev="$1" ;;
+        esac
+        shift
+    done
+    if [[ -b "$dev" ]] && ! cryptsetup isLuks "$dev"; then
+        echo -e "\n\e[1;33mEncrypting $dev\e[0m\n"
+        cryptsetup --key-size 512 luksFormat --sector-size "$sec_size" "$dev"
+        #cryptsetup --pbkdf argon2id --hash sha512 --key-size 512 --iter-time 3000 --use-urandom luksFormat --sector-size "$sec_size" "$dev"
+    fi
+    open_encrypted_disk "$dev" && return 0
+    echo -e "\n\e[1;33mDevice $dev cannot be encrypted.\e[0m\n"
+    unset ENCRYPT
+    return 1
+}
+
+# Unless the home is to be saved, remove all LVM stuff from the disk (or cryptvol)
+clear_lvm_volumes() {
+    local f vg lvlist lv tmp_PART tmp_DISK tmp_HOME tmp_SWAP tmp_ROOTP
+    vg="$(detect_lvm)"
+    if [[ $vg ]]; then
+        modprobe dm_mod
+        vgscan --devices "${VGPART:-$DISK}"
+        vgchange --devices "${VGPART:-$DISK}" -ay
+        tmp_PART="$(pvs --noheadings | awk '{print $1}')"
+        # VGPART having a value implies cryptvol, or user selected root volume with --root /dev/...
+        [[ $tmp_PART == "$VGPART" ]] && tmp_DISK="$DISK" || { tmp_DISK="${tmp_PART:0: -1}" && tmp_DISK="${tmp_DISK%p}"; }      
+        readarray -t lvlist <<<"$(lvs | awk -v vg="$vg" '$2==vg {if (tolower($1) ~ /home/) print "/dev/" vg "/" $1; else o[$1]} END {for (x in o) print "/dev/" vg "/" x}')"
+        f=""
+        for lv in "${lvlist[@]}"; do
+            mount | grep -qF "$lv" && umount "$lv"
+            if [[ ${lv,,} == *home* ]]; then
+                echo
+                read -rp "Preserve 'home' volume $lv [Y/n]? "
+                if [[ ${REPLY,,} =~ ^no? ]]; then
+                    wipefs -aqf "$lv"
+                    lvremove -y "$lv"
+                else
+                    tmp_HOME="$lv"
+                fi
+            else
+                [[ ${lv,,} == *swap* ]] && local tmp_SWAP="$lv"
+                lsblk -no mountpoint "$lv" | grep -qxF '[SWAP]' && swapoff "$lv"
+                [[ ${lv,,} == *root* ]] && local tmp_ROOTP="$lv" &&
+                    wipefs -aq -t "$(detect_fs "$lv")" "$lv"
+                [[ -z $tmp_HOME ]] && lvremove -yf "$lv"  # if home is gone, swap and root are also gone
+            fi
+        done
+        if [[ $tmp_HOME ]]; then
+            # Home is preserved, need to preserve also the LVM structure
+            HOME_PARTITION="$tmp_HOME"
+            [[ $tmp_ROOTP ]] && ROOTP="$tmp_ROOTP"
+            save_with_parents "$HOME_PARTITION" "$ROOTP"
+            is_efi && detect_esp && save_with_parents "$ESP"
+            if [[ $SWAP_PARTITION && $tmp_SWAP ]]; then
+                SWAP_PARTITION="$tmp_SWAP" && save_with_parents "$SWAP_PARTITION"
+                SWAP_SIZE="$(lsblk -no path,size "$SWAP_PARTITION" | awk "\$1==\"$SWAP_PARTITION\" {print \$2}")"
+                swap_u="${SWAP_SIZE: -1}"
+                SWAP_SIZE="${SWAP_SIZE%.*}"
+            elif [[ $tmp_SWAP ]]; then
+                # swap partition not in settings, so remove the detected swap volume
+                lvremove -yf "$tmp_SWAP"
+            fi
+        else
+            # Home not preserved. Remove the whole LVM structure.
+            vgchange -an "$vg"
+            vgremove -yf "$vg"
+            pvremove -y "$(pvs | awk "\$1 ~ \"${VGPART:-$DISK}\" {print \$1}")"
+        fi
+    fi
+}
+
+# If disk is encrypted, need to open the encryption to access the volumes.
+detect_encryption() {
+    local crypt_part
+    crypt_part=$(lsblk -no fstype,path "${1:-"$DISK"}" | awk '/crypto/ {print $2}')
+    if [[ $crypt_part ]]; then
+        VGPART=$(lsblk -no type,path "$crypt_part" | awk '$1=="crypt" {print $2}')
+        [[ -z "$VGPART" ]] && open_encrypted_disk "$crypt_part"
+        # The encryption was open, or VGPART comes from open_encrypted_disk.
+        # Either way, VGPART should now be /dev/mapper/$CRYPTVOL_NAME
+        if [[ $VGPART == "/dev/mapper/$CRYPTVOL_NAME" ]] ; then
+            ENCRYPT=yes
+            # Probably not any new space for another esp, so why not use the one on the disk
+            detect_esp
+            save_with_parents "$VGPART" "$ESP"
+            # detect LVM on this encrypted volume
+            modprobe dm_mod
+            vgscan --devices "$VGPART"
+            pvs | grep -q "$VGPART" && vgchange --devices "$VGPART" -ay
+        fi
+    fi
+}
+
+# Unless something needs to be saved (home?), clear i.e. remove partitions from the disk.
+clear_partitions() {
+    local i parts
+    readarray -t parts <<<"$(lsblk -no path "${VGPART:-$DISK}")"
+    if (( ${#parts[@]} > 1 )) || [[ $VGPART ]]; then
+        echo
+        lsblk -f "$DISK"
+        [[ $YES ]] || echo -e "\nNothing has been altered on disk $DISK yet.\nTo abort installation to disk $DISK, press Ctrl-C now, or answer No."
+        [[ $YES ]] || read -r -p "Scan partitions on $DISK [Y/n]? "
+        if [[ $YES ]] || ! [[ ${REPLY,,} =~ ^no? ]]; then
+            # To wipe volumes, they need to be unmounted
+            mount | grep -qF /mnt && umount -R /mnt
+
+            # First, scan and (maybe) remove all LVM volumes on the disk, unless home was saved ...
+            clear_lvm_volumes
+
+            # ... detect possible esp and boot-partitions
+            [[ -b "$ESP" ]] || detect_esp
+            detect_boot
+
+            if ! is_efi; then
+                remove_saved "$ESP"
+                unset ESP
+                [[ ${BOOT_LOADER,,} =~ ^grub ]] || BOOT_LOADER=grub
+            fi
+
+            [[ $HOME_PARTITION ]] && [[ ! -b "$HOME_PARTITION" ]] && detect_home -- && HOME_PARTITION="$(detect_home --)" &&
+                save_with_parents "$HOME_PARTITION" # This "home" is a genuine partition
+                        
+            # Clear the partitions, unless something is to be saved
+            readarray -t parts <<<"$(lsblk -no type,path "$DISK" | awk '$1=="part" {print $2}')"
+            parts+=("$DISK") # to be sure DISK is last in the array
+            for i in "${parts[@]}"; do ! is_saved "$i" && wipefs -aqf "$i" && echo "Wiped $i" || echo "Skipped wiping $i"; done
+            unset BOOTP
+            partprobe "$DISK"
+        else
+            # Since the disk contains data, and you answered not to scan partitions,
+            # installing cannot continue.
+            echo -e "\nAborting install.\nDisk $DISK contains partitions or volumes, which must be scanned to continue."
+            exit 1
+        fi
+    fi
+}
+
+# If disk is a new/empty NVMe SSD, check LBA Formats and select 4096 bytes (2^12) LBA
+# instead of 512 (2^9), if available. Tested on WD Black SN750 and SN850 M.2 SSD.
+optimize_nvme_lba() {
+    local lbaf
+    # be sure disk is nvme and empty, or return
+    [[ $DISK =~ ^/dev/nvme ]] && [[ $(lsblk -no path "$DISK" | wc -l) -eq 1 ]] || return
+    # Searching for the best relative performance i.e. lowest rp:
+    lbaf=$(nvme id-ns "$DISK" | awk '/in use/ && $1=="lbaf" {u=$2} $1=="lbaf" {split($6,t,":"); rp=strtonum(t[2])} !m || rp<m {m=rp; f=$2} END {if(f!=u) print f}')
+    [[ $lbaf ]] && nvme format --lbaf="$lbaf" "$DISK"
+}
+
+# Create btrfs subvols on dev $1 or ROOTP, which must be btrfs formatted.
+# Leaves these btrfs subvols mounted under $2 or /mnt
+create_btrfs_subvols() {
+    local dev sv subvols mo_ssd mo_hdd mo home_fstype home_mo
+    dev="$ROOTP"
+    target="/mnt"
+    [[ -b "$1" ]] && dev="$1"
+    [[ -d "$2" ]] && target="$2"
+    (($#)) && shift $#
+    
+    [[ -b "$dev" ]] || { echo "Error: Need a btrfs formatted device (ROOTP) to create btrfs subvols on."; exit 1; }
+    blkid -s TYPE -o value "$dev" | grep -qx btrfs || { echo "Error: $dev must be btrfs formatted."; exit 1; }
+
+    # This setup is intended for snapper, but it works also with yabsnap
+    findmnt -n "$target" | grep -qw "$dev" || mount "$dev" "$target"
+    subvols=(@ @var @snapshots)
+    [[ -b $HOME_PARTITION ]] || subvols+=(@home)
+    [[ -z $SWAP_PARTITION ]] && ((SWAP_SIZE > 0)) && subvols+=(@swap)
+    for sv in "${subvols[@]}"; do btrfs subvol create "$target"/"$sv"; done
+    umount "$target"
+
+    # On kernel 6.2+ discard=async is the default
+    mo_ssd="noatime,ssd,compress=zstd:1"
+    mo_hdd="${mo_ssd/,ssd/,autodefrag}" # spinning drive, autodefrag
+    detect_ssd "$DISK" && mo="$mo_ssd" || mo="$mo_hdd"
+
+    # mount root
+    mount -o "${mo}",subvol=@ "$dev" "$target"
+    install -d /mnt/{home,var,.snapshots}
+
+    # mount home
+    if [[ -b $HOME_PARTITION ]]; then
+        # /home is on another partition/volume
+        home_fstype="$(detect_fs "$HOME_PARTITION")"
+        home_fstype="${home_fstype:-btrfs}"
+        home_mo=(-t "$home_fstype")
+        [[ $home_fstype == btrfs ]] && home_mo+=(-o "$mo")
+        mount "${home_mo[@]}" "$HOME_PARTITION" "$target"/home
+    else
+        # /home is just subvolume @home
+        mount -o "${mo}",subvol=@home "$dev" "$target"/home
+        #install -d /mnt/home/.snapshots
+    fi
+
+    # mount @snapshots
+    mount -o "${mo}",subvol=@snapshots "$dev" "$target"/.snapshots
+    #if [[ -d /mnt/home/.snapshots ]]; then
+    #    mount -o "$MO",subvol=@snapshots/home "$ROOTP" /mnt/home/.snapshots
+    #fi
+
+    mount -o noatime,nodatacow,subvol=@var "$dev" "$target"/var
+    # As of today, mount options will be same for every subvolume,
+    # but this should change sometime in the future. Still need to use
+    # chattr +C to set nodatacow for some subvols or directories.
+    chattr +C "$target"/var
+    [[ -d "$target"/var/log ]] || install -dm755 "$target"/var/log
+    chattr +C "$target"/var/log
+
+    # To get /var/lib included in root snapshots,
+    # need to bind mount /var/lib to /usr/var/lib
+    # which is on the root subvolume.
+    # Note: e.g. postgresql and libvirt by default place their data under
+    # /var/lib and these should preferably be placed somewhere else.
+    # This installer takes care of QEMU/libvirt, and the companion
+    # script desktop-install handles PostgreSQL.
+    [[ -d "$target"/usr/var/lib ]] || install -dm755 "$target"/usr/var/lib
+    [[ -d "$target"/var/lib ]] || install -dm755 "$target"/var/lib
+    chattr -C "$target"/var/lib
+    mount --bind "$target"/usr/var/lib "$target"/var/lib
+
+    if [[ ${subvols[*]} == *@swap* ]]; then
+        # subvolume for swapfile, must be nodatacow
+        mkdir "$target"/swap
+        mount -o noatime,nodatacow,subvol=@swap "$dev" "$target"/swap
+        chmod 700 "$target"/swap
+        chattr +C "$target"/swap
+    fi
+}
+
+create_lvm() {
+    local volname
+    pvcreate -Z y -y --dataalignment 1M "$VGPART"
+    # name shall be volgroup# where # is 1 for first, 2 for second etc.
+    volname="volgroup$(( $(vgs --noheadings | wc -l) + 1 ))"
+    vgcreate -Z y -y "$volname" "$VGPART"
+    if [[ $SWAP_PARTITION ]] && (( SWAP_SIZE > 0 )); then
+        # create swap "partition"
+        lvcreate -W y -y -L "${SWAP_SIZE}${swap_u}" "$volname" -n swap && SWAP_PARTITION="/dev/${volname}/swap"
+        mkswap -f -q -U "$GUID_SWAP" "$SWAP_PARTITION"
+        swapon -U "$GUID_SWAP"
+    else
+        SWAP_PARTITION=""
+    fi
+    # create root and home "partition", if one is requested
+    if [[ $HOME_PARTITION && ! -b "$HOME_PARTITION" ]]; then
+        lvcreate -W y -y -L "${ROOT_SIZE}${root_u:-G}" "$volname" -n root && ROOTP="/dev/${volname}/root"
+        lvcreate -W y -y -l 100%FREE "$volname" -n home && HOME_PARTITION="/dev/${volname}/home"
+    else
+        lvcreate -W y -y -l 100%FREE "$volname" -n root && ROOTP="/dev/${volname}/root"
+    fi
+    # activate the new LVM
+    modprobe dm_mod
+    vgscan
+    vgchange -ay
+}
+
+initial_pacstrap() {
+    local k target
+    target="/mnt"
+    [[ -d "$1" ]] && target="$1" && shift
+    declare -a PKGLIST
+
+    for k in "${KERNEL[@]}"; do PKGLIST+=("$k" "$k-headers"); done
+    (($(vgs --noheadings | wc -l))) && PKGLIST+=(lvm2)
+    (($(findmnt -nt btrfs | wc -l))) && PKGLIST+=(btrfs-progs)
+    if ! systemd-detect-virt -q; then  # virtual machines don't need ucode(?)
+        grep -wq GenuineIntel /proc/cpuinfo && PKGLIST+=(intel-ucode)
+        grep -wq AuthenticAMD /proc/cpuinfo && PKGLIST+=(amd-ucode)
+    fi
+    # install dbus-broker
+    PKGLIST+=(dbus-broker-units)
+    
+    # mkinitcpio MUST be installed (not e.g. dracut), because mkinitcpio is building the Unified Kernel Image on EFI systems.
+    pacstrap -K "$target" base "${PKGLIST[@]}" linux-firmware base-devel mkinitcpio openssh nano vim git mtools dosfstools iptables-nft ||
+      { echo -e "Error: pacstrap failed. Check the packages.\n       PKGLIST contains ${#PKGLIST[*]} packages: ${PKGLIST[*]}"; exit 1; }
+    
+    # mkinitcpio.conf doesn't exist before pacstrap
+    in_list "${PKGLIST[*]}" -- "lvm2" && sed -i '/^HOOKS=/s/filesystems/lvm2 &/' "$target"/etc/mkinitcpio.conf
+}
+
+generate_fstab() {
+    local target
+    # generate fstab
+    target="/mnt"
+    [[ -d "$1" ]] && target="$1" && shift
+    genfstab -U "$target" | sed s/relatime/noatime/ | awk 'NR>1 && !/\/var\/lib/ && p!~/\/var\/lib/ {print p} {p=$0} /\/var\/lib/ {getline} END {if (!index($0,"/var/lib")) print}' | tee -a "$target"/etc/fstab
+    [[ -e "$SWAPFILE" ]] && ! grep -q "^${SWAPFILE#/"$target"}" "$target"/etc/fstab && echo -e "${SWAPFILE#/"$target"}    \tnone     \tswap     \tsw       \t0 0\n" >> "$target"/etc/fstab
+    if detect_btrfs "$target"; then
+        # remove subvolids from /etc/fstab, also remove space_cache=v2 as it is default since linux 5.15+, 
+        # and discard=async is default since linux 6.2+
+        sed -Ei -e 's/subvolid=[0-9]+,//' -e 's/space_cache=v2,//' -e 's/discard=async,//' "$target"/etc/fstab
+        # fix mount options for /swap and /var. Not effective now, but should be in the future
+        sed -Ei '/(\/swap|\/var)\s/s/(noatime).*(subvol=)/\1,nodatacow,\2/' "$target"/etc/fstab
+        # add bind mount for /var/lib
+        echo -e "# /var/lib to /usr/var/lib on subvol=/@\n/usr/var/lib\t\t/var/lib\tnone\t\tbind\t0 0\n" >> "$target"/etc/fstab
+    fi
+}
+
+# Prepare new system before entering chroot.
+# Basically create, format and mount partitions, and do the initial pacstrap.
+# Can handle BTRFS or ext4, encrypted or not, with optional swap partition or swapfile or zram swap.
+prepare_disk() {
+    local fm
+
+    [[ -b "$DISK" ]] || select_disk
+    if ! [[ -b "$DISK" ]]; then
+        echo -e "\n\e[1;41m Error \e[0m No target disk found."
+        exit 1
+    fi
+
+    # If disk is encrypted, need to open the encryption to access the volumes.
+    # This script will NOT remove the encryption. To continue with the install,
+    # you must enter the passphrase of the encrypted disk.
+    detect_encryption "$DISK"
+    
+    if detect_systemd-homed -q; then
+        echo -e "\nThere are some \e[1;37msystemd-homed\e[0m homes on disk $DISK."
+        echo -e "\nIf you continue with this install, the home(s) of"
+        echo -e "user(s) \e[1;36m$(detect_systemd-homed)\e[0m will be deleted.\n"
+        read -rp "Continue with this install [y/N]? "
+        [[ ${REPLY,,} =~ ^y(es)? ]] || { echo -e "\nAborting install.\n"; exit 1; }
+    fi
+
+    # Wipe all existing partitions from the target disk?
+    clear_partitions
+
+    # Optimize nvme disks
+    [[ $DISK =~ ^/dev/nvme ]] && optimize_nvme_lba
+        
+    # To get the best performance from your disk, need to know the physical
+    # sector size of the disk. On large drives this is probably 4096.
+    #
+    # Hint: To test sector size 4096 in libvirt, add in the disk part of the XML:
+    # <blockio logical_block_size="4096" physical_block_size="4096"/>
+    SECTOR_SIZE="$(blockdev --getpbsz "$DISK")"
+    echo -e "Physical sector size on $DISK: \e[1;33m$SECTOR_SIZE\e[0m"
+
+    if [[ -z $VGPART ]]; then
+        # disk is empty
+        echo -e "\nCreating partitions on disk $DISK"
+        create_partitions "$DISK"
+    fi
+
+    if [[ -n "$ENCRYPT" && ${#SAVE_PARTS[*]} -eq 0 ]] && ! lsblk -no fstype "$DISK" | grep -q crypto; then
+        encrypt_disk -s "$SECTOR_SIZE" "$VGPART"
+    fi
+
+    # Convert ROOT_SIZE from % to GiB
+    if [[ $root_u == '%' ]]; then
+        ROOT_SIZE=$(( $(lsblk -nbo path,size "$VGPART" | grep -Fw "$VGPART" | awk '{print $2}') * ROOT_SIZE / 100 / 2**30 + 1 ))
+        root_u=G
+    fi
+
+    # Using LVM if needed, i.e. have swap partition or (new) home partition
+    if (( $(vgs --noheadings | wc -l) > 0 )) && [[ $ROOTP =~ ^/dev/(mapper|volgroup) ]]; then
+        # we have an existing LVM structure
+        modprobe dm_mod
+        vgscan
+        vgchange -ay
+        if (( SWAP_SIZE > 0 )) && [[ -b $SWAP_PARTITION ]]; then
+            mkswap -f -q -U "$GUID_SWAP" "$SWAP_PARTITION"
+            swapon -U "$GUID_SWAP"
+        else
+            SWAP_PARTITION=""
+        fi
+    elif [[ $SWAP_PARTITION && $SWAP_SIZE -ge 1 ]] || [[ $HOME_PARTITION && ! -b "$HOME_PARTITION" ]]; then
+        # swap partition or home partition requested, let's build a new LVM
+        create_lvm
+    else
+        # no LVM needed
+        ROOTP="$VGPART"
+    fi
+
+    # DEBUG
+    #lsblk -f >&2; debug_echo -e "${BOOTP:+BOOTP=$BOOTP\n}${ESP:+ESP=$ESP\n}ROOTP=$ROOTP\n${HOME_PARTITION:+HOME_PARTITION=$HOME_PARTITION}"; read -p "Press enter to format the partitions"
+
+    ### Format the partitions
+
+    if [[ $ESP ]]; then
+        echo "Formatting $ESP for esp $EFI"
+        mkfs.fat -F32 -n EFI "$ESP"
+    fi
+
+    if [[ $BOOTP ]]; then
+        echo "Formatting $BOOTP for /boot"
+        # on systemd-boot, this is type XBOOTLDR partition, else it's a normal ext4
+        [[ $ESP && ${BOOT_LOADER,,} == systemd-boot ]] && fm=(mkfs.fat -F32 -n) || fm=(mkfs.ext4 -q -FF -L)
+        "${fm[@]}" BOOT "$BOOTP"
+    fi
+
+    # Some suggestions for disk formats
+    # btrfs:
+    #  -m dup               Since single disk, duplicate metadata (default since linux 5.15)
+    #  -O free-space-tree   enable free-space-tree i.e. space_cache=v2 (default since linux 5.15)
+    #  -O block-group-tree  enable block-group-tree (linux 6.1+, btrfs-progs 6.3+)
+    #  --csum xxhash        fast 64bit checksum algorithm for modern 64bit cpus (linux 5.5+)
+    #
+    # ext4:
+    #  -m 1             set reserved blocks 1% (default is 5%)
+    #  -O fast_commit   enable fast commits
+    #  -O ^has_journal  no journal (increase disk performance)
+
+    echo "Formatting $ROOTP for /"
+    if [[ $BTRFS ]]; then
+        (($(btrfs --version | tr -dc '0-9' | cut -c-2) > 62)) || pacman -Sq --noconfirm btrfs-progs
+        fm=(mkfs.btrfs -f --quiet)
+    else
+        fm=(mkfs.ext4 -FF -m 1)
+    fi
+    "${fm[@]}" -L ROOT "$ROOTP"
+
+    # If home is formatted, the format and options will be same as on ROOTP
+    if [[ $HOME_PARTITION ]] && ! { is_saved "$HOME_PARTITION" && detect_fs -q "$HOME_PARTITION"; } then
+        REPLY=y  # If HOME_PARTITION is not formatted, format it without questions
+        detect_fs -q "$HOME_PARTITION" &&
+          echo -e "\nHome volume $HOME_PARTITION is already formatted." &&
+          read -rp "Format it anyway [y/N]? "
+        [[ "${REPLY,,}" =~ ^y(es)? ]] && echo "Formatting $HOME_PARTITION for /home" && "${fm[@]}" -L HOME "$HOME_PARTITION"
+    fi
+
+    ### Mount the partitions
+
+    # Mounting root
+    if [[ $BTRFS ]]; then
+        create_btrfs_subvols "$ROOTP" /mnt
+    else
+        mount "$ROOTP" /mnt
+    fi
+
+    # Mounting /boot, almost never needed
+    if [[ $BOOTP ]]; then
+        echo "Mounting /mnt/boot"
+        install -d /mnt/boot
+        mount "$BOOTP" /mnt/boot
+        [[ $EFI ]] || EFI=/boot/efi
+    fi
+
+    # Mounting esp on every EFI system
+    if [[ $ESP ]]; then
+        [[ $EFI ]] || EFI=/boot
+        echo "Mounting esp /mnt/${EFI#/}"
+        install -d "/mnt/${EFI#/}"
+        mount -o fmask=0137,dmask=0027,gid="$(grep "^wheel:" /etc/group | cut -d: -f3)" "$ESP" "/mnt/${EFI#/}"
+    fi
+
+    # If home partition, and nothing (i.e. subvolume @home) is mounted to /mnt/home
+    if [[ -b "$HOME_PARTITION" ]] && ! findmnt -n /mnt/home &>/dev/null; then
+        echo "Mounting /mnt/home"
+        install -d /mnt/home
+        detect_btrfs "$HOME_PARTITION" && home_mo=(-o "noatime,compress=zstd") || home_mo=()
+        mount "${home_mo[@]}" "$HOME_PARTITION" /mnt/home
+    fi
+
+    # Mounting swap (if present)
+    if [[ -z $SWAP_PARTITION && $SWAP_SIZE -ge 1 ]]; then
+        echo "Creating swapfile"
+        SWAPFILE="/mnt/swap/swapfile"
+        if btrfs subvol list /mnt | grep -wq '@swap'; then
+            # need btrfs-progs v6.1.3+ for mkswapfile
+            btrfs filesystem mkswapfile --size "${SWAP_SIZE}${swap_u,}" "$SWAPFILE"
+        else
+            # not btrfs
+            mkdir -m700 /mnt/swap
+            dd if=/dev/zero of="$SWAPFILE" bs="1${swap_u}" count="$SWAP_SIZE" status=progress
+            chmod 0600 "$SWAPFILE"
+            mkswap "$SWAPFILE"
+        fi
+        swapon "$SWAPFILE"
+    fi
+    
+    # detect partitions
+    udevadm trigger
+
+    ### Install base system in the new environment with pacstrap
+
+    sed -Ei 's/^#?(ParallelDownloads).*/\1 = 5/' /etc/pacman.conf
+    sed -i 's/^#Color$/Color/' /etc/pacman.conf
+    if [[ -z "$SKIP_REFLECTOR" ]]; then
+        echo "Waiting for reflector to finish..."
+        wait -f $!
+    fi
+
+    # If not present, add mirror.osbeck.com as the first Server in mirrorlist
+    local f=/etc/pacman.d/mirrorlist
+    # shellcheck disable=SC2016   # This is a literal string, no need for expansion
+    grep -qF mirror.osbeck.com "$f" || sed -i '0,/^Server/s,^Server,Server = https://mirror.osbeck.com/archlinux/$repo/os/$arch\n&,' "$f"
+    
+    # don't allow any russian domains outside russia, since some of them may cause problems 
+    [[ $(curl -s http://ip-api.com/line?fields=country) != "Russia"* ]] && sed -i '/^Server = .*\.ru\//d' "$f"
+    
+    initial_pacstrap /mnt
+    generate_fstab /mnt
+}
+
+############### The next section is mainly for the chroot ################
+
+# Output the PARTUUID of the partition that has the UUID $1 
+uuid_to_partuuid() {
+    local a="[0-9a-fA-F]"
+    [[ $1 =~ $a{8}-$a{4}-$a{4}-$a{4}-$a{12} ]] && blkid -t UUID="$1" -s PARTUUID -o value
+}
+
+secure_boot_setup() {
+    local f
+    pacman -Sq --noconfirm --needed sbctl
+    sbctl create-keys && sbctl enroll-keys --microsoft || return 1
+    f=/usr/local/bin/sbctl-sign
+    echo \
+'#!'"/usr/bin/env bash
+[[ \$1 == '-s' ]] && s=\"-s\"
+for k in linux linux-lts linux-hardened linux-rt linux-rt-lts linux-zen; do
+    [[ -e \"$EFI/EFI/Linux/arch-$k.efi\" ]] && /usr/bin/sbctl sign \$s \"$EFI/EFI/Linux/arch-$k.efi\"
+done
+bootctl is-installed -q && /usr/bin/sbctl sign -s -o /usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed /usr/lib/systemd/boot/efi/systemd-bootx64.efi" > "$f"
+    chmod +x "$f"
+    [[ -d /etc/pacman.d/hooks ]] || mkdir -p /etc/pacman.d/hooks
+    f=/etc/pacman.d/hooks/zz-secure-boot.hook
+    if [[ ! -e "$f" ]]; then
+        echo \
+"[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = boot/*
+Target = efi/*
+Target = usr/lib/modules/*/vmlinuz
+Target = usr/lib/initcpio/*
+Target = usr/lib/**/efi/*.efi
+
+[Action]
+Description = Sign Unified Kernel Images with Secure Boot...
+When = PostTransaction
+Exec = /usr/local/bin/sbctl-sign" > "$f"
+    fi
+}
+
+# Configure the system to use Unified Kernel Image with mkinitcpio.
+# Systemd-boot, rEFInd and EFISTUB use this, if esp is not mounted to /boot
+unified_kernel_image() {
+    local efi opt quiet secboot preset k
+
+    while [[ $1 ]]; do
+      case "$1" in
+             -e | --efi) efi="$2"; shift 2;;
+         -o | --options) opt="$2"; shift 2;;
+           -q | --quiet) echo "quiet bgrt_disable loglevel=3 rd.systemd.show_status=auto rd.udev.log_level=3" > /etc/cmdline.d/quiet.conf
+                         shift;;
+      -s | --secureboot) secboot=yes; shift;;
+                     --) shift; break;;
+                      *) shift;;
+      esac
+    done
+    [[ -d "$efi" && $efi != /boot ]] || return 1
+    [[ $opt ]] && echo "${opt}" > /etc/kernel/cmdline
+    mkdir -p "$efi/EFI/Linux"
+    # By default, the kernel, initramfs and ucodes are NOT copied to the esp,
+    # because the Unified Kernel Image will boot without them.
+    # However, see under this block, how to activate the copying.
+    rm -f /etc/mkinitcpio.d/*.preset
+    preset="/etc/mkinitcpio.d/${KERNEL[0]}.preset"
+    echo \
+"# mkinitcpio preset file for the '${KERNEL[0]}' package
+
+# Directory where to create the efi images
+ESP_DIR=\"${efi}/EFI/Linux\"
+
+ALL_config=\"/etc/mkinitcpio.conf\"
+ALL_kver=\"/boot/vmlinuz-${KERNEL[0]}\"" >> "$preset"
+    [[ -e /boot/amd-ucode.img ]] && echo "ALL_microcode=\"/boot/amd-ucode.img\"" >> "$preset"
+    [[ -e /boot/intel-ucode.img ]] && echo "ALL_microcode=\"/boot/intel-ucode.img\"" >> "$preset"
+    echo \
+"#[[ -e /boot/amd-ucode.img ]] && cp -af /boot/amd-ucode.img \"\${ESP_DIR}/\"
+#[[ -e /boot/intel-ucode.img ]] && cp -af /boot/intel-ucode.img \"\${ESP_DIR}/\"
+#cp -af /boot/vmlinuz-${KERNEL[0]} \"\${ESP_DIR}/\"
+
+PRESETS=('default' 'fallback')
+
+default_image=\"/boot/initramfs-${KERNEL[0]}.img\"
+default_uki=\"\${ESP_DIR}/arch-${KERNEL[0]}.efi\"
+default_options=\"quiet --splash /usr/share/systemd/bootctl/splash-arch.bmp\"
+#cp -af /boot/initramfs-${KERNEL[0]}.img \"\${ESP_DIR}/\"
+
+fallback_image=\"/boot/initramfs-${KERNEL[0]}-fallback.img\"
+fallback_uki=\"\${ESP_DIR}/arch-${KERNEL[0]}-fallback.efi\"
+fallback_options=\"-S autodetect\"
+#cp -af /boot/initramfs-${KERNEL[0]}-fallback.img \"\${ESP_DIR}/\"" >> "$preset"
+
+    # If you want to activate the copying of the kernel, initramfs and ucodes to the esp,
+    # uncomment the following line:
+    #sed -i '/^#[^ ]/s/^#//' $preset
+
+    # Create presets for all installed kernels, and run mkinitcpio on them
+    for k in "${KERNEL[@]}"; do
+        [[ $k == "${KERNEL[0]}" ]] || sed "s/${KERNEL[0]}/$k/" "$preset" > "/etc/mkinitcpio.d/${k}.preset"
+        mkinitcpio -p "$k"
+    done
+}
+
+# Handle /etc/mkinitcpio.conf HOOKS when the rootfs is encrypted,
+# and 'udev' is in the HOOKS
+_encrypted_boot_udev() {
+    local tag
+    sed -i '/^HOOKS=/s/keyboard keymap //;/^HOOKS=/s/consolefont //' /etc/mkinitcpio.conf
+    sed -i '/^HOOKS=/s/autodetect/& keyboard keymap consolefont/' /etc/mkinitcpio.conf
+    grep -q '^HOOKS=.* lvm2 ' /etc/mkinitcpio.conf && tag="lvm2" || tag="filesystems"
+    sed -i "/^HOOKS=/s/${tag}/encrypt &/" /etc/mkinitcpio.conf  
+}
+
+# Handle /etc/mkinitcpio.conf HOOKS when the rootfs is encrypted,
+# and 'systemd' is instead of 'udev' in the HOOKS. The benefit is, that
+# /etc/crypttab.initramfs can be utilized, and no kernel cmdline args are needed.
+_encrypted_boot_systemd() {
+    local disk uuid cryptname tag discard
+    while [[ $1 ]]; do
+      case "$1" in
+            -d | --disk) disk="$2"; shift 2;;
+       -c | --cryptname) cryptname="$2"; shift 2;;
+            -u | --uuid) uuid="$2"; shift 2;;
+                     --) shift; break;;
+                      *) shift;;
+      esac
+    done
+    sed -i '/^HOOKS=/s/udev /systemd /' /etc/mkinitcpio.conf
+    sed -i '/^HOOKS=/s/keyboard keymap //;/^HOOKS=/s/consolefont //' /etc/mkinitcpio.conf
+    sed -i '/^HOOKS=/s/autodetect/& keyboard sd-vconsole/' /etc/mkinitcpio.conf  # no consolefont needed
+    grep -q '^HOOKS=.* lvm2 ' /etc/mkinitcpio.conf && tag="lvm2" || tag="filesystems"
+    sed -i "/^HOOKS=/s/${tag}/sd-encrypt &/" /etc/mkinitcpio.conf
+    detect_ssd "$disk" && discard="discard" || discard=""
+    [[ -n "$cryptname" ]] && [[ -n "$uuid" ]] &&
+      echo "${cryptname}  UUID=${uuid}  -  ${discard}" >> /etc/crypttab.initramfs &&
+      chmod 600 /etc/crypttab.initramfs
+}
+
+# Install systemd-boot on an EFI system. May install an Unified Kernel Image.
+# Usage: _install_systemd_boot [args...]
+#        where [args...] come from function install_bootloader()
+# Do not call this function directly. Only install_bootloader() does the
+# required checks and preparations to call this function.
+_install_systemd-boot() {
+    local opt entry ep discard disk efi cryptname rootname uuid quiet secboot timeout=5
+
+    while [[ $1 ]]; do
+      case "$1" in
+         -t | --timeout) timeout="$2"; shift 2;;
+            -d | --disk) disk="$2"; shift 2;;
+             -e | --efi) efi="$2"; shift 2;;
+       -c | --cryptname) cryptname="$2"; shift 2;;
+        -r | --rootname) rootname="$2"; shift 2;;
+            -u | --uuid) uuid="$2"; shift 2;;
+           -q | --quiet) quiet="--quiet"; shift;;
+      -s | --secureboot) secboot=yes; shift;;
+                     --) shift; break;;
+                      *) shift;;
+      esac
+    done
+
+    [[ -d $efi ]] || return 1
+    bootctl --esp-path="$efi" install || echo -e "\nbootctl install \e[1;31merror\e[0m esp = ${efi}\n"
+
+    [[ $efi == /boot ]] || ep="/EFI/Linux"
+    echo -e "default arch-${KERNEL[0]}.*\ntimeout ${timeout}\nconsole-mode keep" > "${efi}/loader/loader.conf"
+    entry="${efi}/loader/entries/arch.conf"
+    [[ $ep ]] && echo -e "# This entry wont't work, unless the kernel, initramfs and ucodes\n# are copied to the esp at ${efi}${ep}/\n# Check file /etc/mkinitcpio.d/${KERNEL[0]}.preset" > "$entry"
+    echo "title Arch Linux" >> "$entry"
+    echo "linux ${ep}/vmlinuz-${KERNEL[0]}" >> "$entry"
+    [[ -e /boot/intel-ucode.img ]] && echo "initrd ${ep}/intel-ucode.img" >> "$entry"
+    [[ -e /boot/amd-ucode.img ]] && echo "initrd ${ep}/amd-ucode.img" >> "$entry"
+    echo "initrd ${ep}/initramfs-${KERNEL[0]}.img" >> "$entry"
+
+    [[ $cryptname ]] && _encrypted_boot_systemd -d "$disk" -c "$cryptname" -u "$uuid" --
+    if [[ $rootname == /dev/mapper/* || $rootname == /dev/volgroup* ]]; then
+        # root is on LVM or is encrypted
+        opt=(root="${rootname}")
+    else
+        # root is not encrypted and not LVM, so let's use partuuid
+        opt=(root=PARTUUID="$(uuid_to_partuuid "$uuid")")
+    fi
+    opt+=(rw)
+    # If btrfs, must tell the root subvol to kernel, unless default subvolume is set
+    if detect_btrfs; then
+        detect_btrfs_default_id -q || opt+=(rootfstype=btrfs rootflags=subvol="$(btrfs_root_subvol)")
+    fi
+    echo "${opt[*]}" > /etc/cmdline.d/root.conf
+
+    # Output the options line into the boot entry. You may add other kernel parameters
+    echo "options $(</etc/cmdline.d/root.conf) $([ -e /etc/cmdline.d/security.conf ] && cat /etc/cmdline.d/security.conf)" >> "$entry"
+
+    if [[ $ep ]]; then
+        # Unified Kernel Image is necessary since $efi is not /boot
+        unified_kernel_image --efi "$efi" "$quiet" ${secboot:+-s} --
+        sed -i "/^default /s/ .*/ arch-${KERNEL[0]}.efi/" "$efi/loader/loader.conf"
+        [[ ! -e "${efi}${ep}/vmlinuz-${KERNEL[0]}" || ! -e "${efi}${ep}/initramfs-${KERNEL[0]}.img" ]] && sed -i 's/^/#/' "$entry"
+        # This entry wouldn't work unless the kernel, initramfs and ucodes were copied to the esp.
+        # Also, the entry is not needed with the Unified Kernel Image.
+    fi
+
+    install -d /etc/pacman.d/hooks
+    echo \
+"[Trigger]
+Operation = Upgrade
+Type = Package
+Target = systemd
+
+[Action]
+Description = Gracefully upgrading systemd-boot...
+When = PostTransaction
+Exec = /usr/bin/systemctl restart systemd-boot-update.service" > /etc/pacman.d/hooks/100-systemd-boot.hook
+
+    BOOT_LOADER="systemd-boot"
+}
+
+# Install rEFInd on an EFI system. May install an Unified Kernel Image.
+# Usage: _install_refind [args...]
+#        where [args...] come from function install_bootloader.
+# Do not call this function directly. Only install_bootloader() does the
+# required checks and preparations to call this function.
+_install_refind() {
+    local opt b d rf discard disk efi cryptname uuid rootname quiet minimal_theme secboot timeout=5
+
+    while [[ $1 ]]; do
+      case "$1" in
+         -t | --timeout) timeout="$2"; shift 2;;
+            -d | --disk) disk="$2"; shift 2;;
+             -e | --efi) efi="$2"; shift 2;;
+       -c | --cryptname) cryptname="$2"; shift 2;;
+        -r | --rootname) rootname="$2"; shift 2;;
+            -u | --uuid) uuid="$2"; shift 2;;
+           -q | --quiet) quiet="--quiet"; shift;;
+        --minimal-theme) minimal_theme=yes; shift;;
+      -s | --secureboot) secboot=yes; shift;;
+                     --) shift; break;;
+                      *) shift;;
+      esac
+    done
+    [[ -d $efi ]] || return 1
+
+    pacman -Sq --noconfirm --needed refind
+    refind-install
+    sed -i 1,2d /boot/refind_linux.conf
+
+    if [[ $cryptname ]]; then
+        # root is encrypted
+        _encrypted_boot_udev
+        detect_ssd "$disk" && discard=":allow-discards" || discard=""
+        opt=(cryptdevice=UUID="${uuid}:${cryptname}${discard}" root="${rootname}")
+        sed -i "s|root=$rootname|${opt[*]}|" /boot/refind_linux.conf
+    elif [[ $rootname == /dev/mapper/* || $rootname == /dev/volgroup* ]]; then
+        # root is on LVM or encrypted
+        opt=(root="${rootname}")
+    else
+        # root is not encrypted nor LVM
+        opt=(root=PARTUUID="$(uuid_to_partuuid "$uuid")")
+    fi
+    opt+=(rw add_efi_memmap)
+    # If btrfs, must tell the root subvol to kernel, unless default subvolume is set
+    if detect_btrfs; then
+        detect_btrfs_default_id -q || opt+=(rootfstype=btrfs rootflags=subvol="$(btrfs_root_subvol)")
+        mkdir -p "${efi}/EFI/refind/drivers_x64"
+        cp /usr/share/refind/drivers_x64/btrfs_x64.efi "${efi}/EFI/refind/drivers_x64/"
+    fi
+    b=""
+    if [[ $efi != /boot ]]; then
+        echo "${opt[*]}" > /etc/cmdline.d/root.conf
+        unified_kernel_image --efi "$efi" "$quiet" ${secboot:+-s} --
+        cp /usr/share/refind/icons/os_arch.png "${efi}/EFI/Linux/arch-${KERNEL[0]}.png"
+        cp /usr/share/refind/icons/os_arch.png "${efi}/EFI/Linux/arch-${KERNEL[0]}-fallback.png"
+        detect_btrfs && b="$(btrfs_root_subvol)"\\boot
+    fi
+
+    # Edit refind.conf
+    rf="$efi/EFI/refind/refind.conf"
+    [[ -e /boot/intel-ucode.img ]] && opt+=(initrd="${b}"\\intel-ucode.img)
+    [[ -e /boot/amd-ucode.img ]] && opt+=(initrd="${b}"\\amd-ucode.img)
+    d=("$(awk -v opt="${opt[*]}" -v efi="${efi}" -v krnl="${KERNEL[0]}" -v btr="${b:+/${b%\\boot}}" 'BEGIN{f=""; i="%4s"} !f || !/ volume| loader| initrd| options| disabled/ {print} f && / volume / {printf(i "%s   EFI\n","",$1)} f && / loader| initrd/ {if (efi=="/boot") sub(/^\/boot/,"",$2); sub(/linux/,krnl,$2); printf(i "%s   %s\n","",$1,btr $2)} f && / options/ {printf(i "%s  \"%s\"\n","",$1,opt)} f && / disabled/ {f=0; if (efi!="/boot") print} f && / submenuentry/ {i="%8s"} i~/8/ && /}/ {i="%4s"} !f && f!=0 && /^\s*menuentry\s+"Arch Linux"/ {f=1}' "$rf")")
+    printf '%s\n' "${d[@]}" > "$rf"
+    # Notice that "Arch Linux" entry in refind.conf is left disabled, if Unified Kernel Image is in use (i.e. efi is not "/boot")
+    # rEFInd will find the UKI anyway.
+    sed -Ei 's/#?(write_systemd_vars) .*/\1 true/' "$rf"
+    sed -i "/^timeout /s/ .*/ ${timeout}/" "$rf"
+
+    # Optional rEFInd-minimal theme
+    if [[ $minimal_theme ]]; then
+        mkdir -p "${efi}/EFI/refind/themes/rEFInd-minimal"
+        git clone https://github.com/evanpurkhiser/rEFInd-minimal.git "${efi}/EFI/refind/themes/rEFInd-minimal"
+        echo -e "\ninclude themes/rEFInd-minimal/theme.conf" >> "$rf"
+    fi
+
+    install -d /etc/pacman.d/hooks
+    echo \
+"[Trigger]
+Operation = Upgrade
+Type = Package
+Target = refind
+
+[Action]
+Description = Updating rEFInd on ESP
+When = PostTransaction
+Exec = /usr/bin/refind-install" > /etc/pacman.d/hooks/100-refind-upgrade.hook
+
+    BOOT_LOADER=rEFInd
+}
+
+# Install EFISTUB on EFI system. May install an Unified Kernel Image.
+# Usage: _install_efistub [args...]
+#        where [args...] come from funtion install_bootloader
+# Do not call this function directly. Only install_bootloader() does the
+# required checks and preparations to call this function.
+_install_efistub() {
+    local opt ldr discard disk efi cryptname uuid quiet secboot rootname part
+
+    while [[ $1 ]]; do
+      case "$1" in
+            -d | --disk) disk="$2"; shift 2;;
+             -e | --efi) efi="$2"; shift 2;;
+       -c | --cryptname) cryptname="$2"; shift 2;;
+        -r | --rootname) rootname="$2"; shift 2;;
+            -u | --uuid) uuid="$2"; shift 2;;
+           -q | --quiet) quiet="--quiet"; shift;;
+      -s | --secureboot) secboot=yes; shift;;
+                     --) shift; break;;
+                      *) shift;;
+      esac
+    done
+    [[ -d $efi ]] || return 1
+    [[ $cryptname ]] && _encrypted_boot_systemd -d "$disk" -c "$cryptname" -u "$uuid" --
+    if [[ $rootname == /dev/mapper/* || $rootname == /dev/volgroup* ]]; then
+        opt=('root='"$rootname")
+    else
+        opt=('root=PARTUUID='"$(uuid_to_partuuid "$uuid")")
+    fi
+    opt+=(rw)
+    # If btrfs, must tell the subvol to kernel, unless default subvolume is set
+    if detect_btrfs; then
+        detect_btrfs_default_id -q || opt+=(rootfstype=btrfs rootflags=subvol="$(btrfs_root_subvol)")
+    fi
+
+    pacman -Sq --noconfirm --needed efibootmgr
+
+    if efibootmgr | grep -Eq '\* [Aa]rch ?[Ll]inux'; then
+        [[ $YES ]] || echo -e "\nThere are \"offending\" boot entries in the EFI, which should be\nremoved before adding a new entry with similar name.\n"
+        [[ $YES ]] || efibootmgr
+        echo
+        [[ $YES ]] || read -rp "Delete all \"Arch Linux\" entries in the EFI [Y/n]? "
+        [[ -z $YES && ${REPLY,,} =~ ^no? ]] || efibootmgr | awk '/\* [Aa]rch ?[Ll]inux/ {print substr($1,5,4)}' | xargs -I {} efibootmgr -b {} -B
+    fi
+
+    if [[ $efi == /boot ]]; then
+        [[ -e /boot/intel-ucode.img ]] && opt+=('initrd=\intel-ucode.img')
+        [[ -e /boot/amd-ucode.img ]] && opt+=('initrd=\amd-ucode.img')
+        opt+=('initrd=\initramfs-'"${KERNEL[0]}".img)
+        ldr="/vmlinuz-${KERNEL[0]}"
+        options="--unicode '${opt[*]}'"
+        # DEBUG
+        #echo -e "_install_efistub():\noptions: $options\nopt: $opt"; read -rp "Press enter to continue"
+    else
+        echo "${opt[*]}" > /etc/cmdline.d/root.conf
+        unified_kernel_image --efi "$efi" "$quiet" ${secboot:+-s} --
+        ldr="/EFI/Linux/arch-${KERNEL[0]}.efi"
+        options=""
+    fi
+    # If boot problems with EFISTUB, boot into EFI Shell, and issue command:
+    #   FS1:archlinux
+    echo "${ldr//\//\\} ${opt[*]}" > "${efi}/archlinux.nsh"
+
+    part=$(lsblk -no path,mountpoint | grep " $efi" | cut -d' ' -f1)
+    disk=${part:0: -1}; disk=${disk%p}
+    part=${part: -1}
+    # shellcheck disable=SC2086
+    efibootmgr --disk "$disk" \
+               --part "$part" \
+               --create  --label "Arch Linux" \
+               --loader "$ldr" \
+               $options &&
+    BOOT_LOADER=EFISTUB &&
+    cat > /usr/local/bin/add-efistub << EOF
+#!/usr/bin/env bash
+if efibootmgr | grep -q 'Arch Linux'; then
+  efibootmgr
+  echo
+  read -rp "Add another \"Arch Linux\" to EFISTUB [y/N]? "
+  [[ \${REPLY,,} =~ ^y(es)? ]] || exit
+fi
+sudo efibootmgr --disk "$disk" --part "$part" --create --label "Arch Linux" --loader "$ldr" $options
+EOF
+    [[ -e /usr/local/bin/add-efistub ]] && chmod +x /usr/local/bin/add-efistub
+}
+
+# Grub can be installed on both EFI and legacy MBR systems.
+# Usage: _install_grub [args...]
+#        where [args...] come from function install_bootloader
+# Do not call this function directly. Only install_bootloader() does the
+# required checks and preparations to call this function.
+_install_grub() {
+    local args opt discard disk efi cryptname uuid osprober f timeout=5
+
+    while [[ $1 ]]; do
+      case "$1" in
+         -t | --timeout) timeout="$2"; shift 2;;
+            -d | --disk) disk="$2"; shift 2;;
+             -e | --efi) efi="$2"; shift 2;;
+       -c | --cryptname) cryptname="$2"; shift 2;;
+            -u | --uuid) uuid="$2"; shift 2;;
+            --os-prober) osprober=1; shift;;
+                     --) shift; break;;
+                      *) shift;;
+      esac
+    done
+
+    pacman -Sq --noconfirm --needed grub ${efi:+efibootmgr} ${osprober:+os-prober}
+     
+    if [[ $efi ]]; then
+        args=(--target=x86_64-efi --efi-directory="$efi" --bootloader-id=GRUB)
+    else
+        args=(--target=i386-pc "$disk")
+    fi
+    grub-install "${args[@]}" || return 1
+
+    if [[ $cryptname ]]; then
+        _encrypted_boot_udev
+        detect_ssd "$disk" && discard=":allow-discards" || discard=""
+        opt=(cryptdevice=UUID="${uuid}":"${cryptname}${discard}")
+        sed -i '/^#GRUB_ENABLE_CRYPTODISK=y/s/^#//' /etc/default/grub
+    else
+        opt=()
+    fi
+    sed -Ei "s/(TIMEOUT)=.*/\1=${timeout}/" /etc/default/grub
+    if detect_btrfs; then
+        pacman -Sq --noconfirm --needed grub-btrfs inotify-tools
+        #sed -Ei 's/^HOOKS=[^\)]+/& grub-btrfs-overlayfs/' /etc/mkinitcpio.conf
+        detect_btrfs_default_id -q || opt+=(rootfstype=btrfs rootflags=subvol="$(btrfs_root_subvol)")
+    fi
+    [[ ${opt[*]} ]] && sed -i "/^GRUB_CMDLINE_LINUX=/s/\"\$/${opt[*]}\"/" /etc/default/grub
+    if systemd-detect-virt -q; then
+        [[ $VIRT_RESOLUTION ]] && sed -i "/GRUB_CMDLINE_LINUX_DEFAULT=/s/\"\$/ video=${VIRT_RESOLUTION}\"/" /etc/default/grub
+    fi
+    if detect_lvm -q "$disk" || detect_lvm -q "$cryptname"; then
+        grep -q '^GRUB_PRELOAD_MODULES=' /etc/default/grub && sed -i '/^GRUB_PRELOAD_MODULES=/s/"$/ lvm"/' /etc/default/grub ||
+          echo "GRUB_PRELOAD_MODULES=\"lvm\"" >> /etc/default/grub
+    fi
+    if [[ $osprober ]]; then
+        grep -q '#GRUB_DISABLE_OS_PROBER=false' /etc/default/grub &&
+          sed -i '/#GRUB_DISABLE_OS_PROBER=false/s/^#//' /etc/default/grub ||
+          echo -e "\nGRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
+    fi
+
+    # Creating two helper scripts: "update-grub" and "install-grub"
+    # Use update-grub always after editing the Grub config at /etc/default/grub
+    # Use install-grub if you want to re-install grub e.g. after a Grub update.
+    # This re-install is done with the same arguments as the original install.
+    # Obviously, you can do both tasks manually, if you know what you're doing.
+    f=/usr/local/bin/update-grub
+    echo -e '#!'"/usr/bin/env bash\nset -e\nexec grub-mkconfig -o /boot/grub/grub.cfg" > "$f"
+    chmod +x "$f"
+
+    f=/usr/local/bin/install-grub
+    echo -e \
+'#!'"/usr/bin/env bash\nset -e\n[[ \$1 == \"-y\" ]] && REPLY=yes
+|| read -rp \"Do you want to re-install GRUB [y/N]? \"
+if [[ \${REPLY,} == y* ]]; then
+  ((UID == 0)) || { echo -e \"Only root can install grub.\nTry: sudo \$(basename \$0)\"; exit 1; }
+  grub-install ${args[*]} && grub-mkconfig -o /boot/grub/grub.cfg
+fi" > "$f"
+    chmod +x "$f"
+
+    # pacman hook to re-install GRUB after each grub update.
+    # This hook uses the install-grub script which we just created.
+    # If you later install some other bootloader, remember to remove this hook!
+    f=/etc/pacman.d/hooks/100-grub-upgrade.hook
+    [[ -d "$(dirname "$f")" ]] || mkdir "$(dirname "$f")"
+    echo \
+"[Trigger]
+Operation = Upgrade
+Type = Package
+Target = grub
+
+[Action]
+Description = Re-installing GRUB after upgrade...
+When = PostTransaction
+Exec = /usr/local/bin/install-grub -y" > "$f"
+
+    grub-mkconfig -o /boot/grub/grub.cfg && BOOT_LOADER=grub
+}
+
+# Install the bootloader.
+# Arguments:
+# -b, --bootloader <b> : <b> is the bootloader to install: grub (default), systemd-boot, rEFInd or EFISTUB
+# -t, --timeout <t>    : <t> is the timeout in seconds (default is 5) before the default os is booted.
+#                        All bootloaders except EFISTUB adhere to this timeout.
+# -d, --disk <d>       : <d> is the disk where /boot is, assuming / is on the same disk.
+# -e, --efi <e>        : <e> is the mountpoint of the EFI partition (esp) on EFI systems.
+# -c, --cryptname <c>  : <c> is the name of the encryption volume where root is.
+# -r, --rootname <r>   : <r> is the mapper name of the encrypted root.
+# -u, --uuid <u>       : <u> is the UUID of the root partition.
+# -q, --quiet          : Silent boot, only errors are shown (i.e. loglevel=3 etc.)
+# -s, --secureboot     : Secure boot, EXPERIMENTAL
+# --os-prober          : Install os-prober, if you intend to dual-boot with Grub.
+# --minimal-theme      : Install rEFInd-minimal theme, only for rEFInd obviously.
+install_bootloader() {
+    local args opt bootldr efi osprober quiet secboot
+
+    if ! args="$(getopt -uo b:c:d:e:r:t:u:qs -l bootloader:,disk:,efi:,cryptname:,rootname:,timeout:,uuid:,minimal-theme,os-prober,quiet,secureboot  -- "$@")"; then
+        echo -e "Error: Invalid arguments in install_bootloader:\n       $*"
+        echo -e "\nInstalling Grub with generic options."
+        read -rp "* Press enter to continue "
+        _install_grub -d "$DISK" ${ESP:+-e "$EFI"} -u "$UUID" ${CRYPTVOL:+-c "$CRYPTVOL"}
+        return
+    fi
+    eval set -- "$args"
+    while [[ $1 ]]; do
+      case "$1" in
+      -b | --bootloader) bootldr="$2"; shift 2;;
+             -e | --efi) efi="$2"; shift 2;;
+            --os-prober) osprober=yes; shift;;
+           -q | --quiet) quiet=yes; shift;;
+      -s | --secureboot) secboot=yes; shift;;
+                     --) shift; break;;
+                      *) shift;;
+      esac
+    done
+
+    if [[ $osprober ]] && [[ -n $efi && -n $bootldr && ${bootldr^^} != "GRUB" ]]; then
+        echo -e "You have selected 'os-prober' with $bootldr, but 'os-prober' is for Grub."
+        echo -e "Select how to proceed:"
+        PS3='Select #:'
+        [[ $YES ]] || select _ in "Install $bootldr (default)" "Install Grub with os-prober"; do (( REPLY == 2 )) && bootldr=grub; break; done
+        unset PS3
+    fi
+
+    IFS=" " read -r -a opt <<< "$args"
+
+    # DEBUG
+    #echo -e "bootldr=$bootldr : efi=$efi\n ${#opt[@]} args: ${opt[*]}"; read -rp "Press enter to install ${bootldr^^}"
+
+    if [[ -z $efi ]]; then
+        _install_grub "${opt[@]}"
+    else
+        if [[ $efi != /boot ]]; then
+           echo -e "vfat\nnls_cp437\nnls_ascii" > /etc/modules-load.d/vfat.conf
+        fi
+        case "${bootldr^^}" in
+          SYSTEMD-BOOT*) _install_systemd-boot "${opt[@]}";;
+               EFISTUB*) _install_efistub "${opt[@]}";;
+                REFIND*) _install_refind "${opt[@]}";;
+                      *) _install_grub "${opt[@]}";;
+        esac
+    fi
+    [[ $secboot ]] && [[ $efi ]] && secure_boot_setup ${quiet:+-q} || { unset secboot; args="${args/--secureboot}"; args="${args/ -s}"; }
+    [[ $secboot ]] && /usr/local/bin/sbctl-sign -s && sbctl status
+}
+
+# is_user [-p] username
+# Return whether username is a valid user account on the new system.
+# If optional arg. -p is present, print out the username, when user exists.
+# Note: This function works both in and out of chroot.
+is_user() {
+    local user rv=0 print_name=0
+    while [[ $1 ]]; do
+        [[ $1 == "-p" ]] && print_name=1 || user="$1"
+        shift
+    done
+    if is_chroot; then
+        id -u "$user" &>/dev/null && rv=1
+    else
+        grep -q ^"$user": /mnt/etc/passwd && rv=1
+    fi 
+    ((rv)) && ((print_name)) && printf '%s' "$user"
+    [[ $rv -eq 1 ]]
+}
+
+# home_of username
+# Outputs the home directory of user $1
+# Outputs nothing unless the home exists
+home_of() {
+    local home
+    home="$(grep ^"$1": /etc/passwd | cut -d: -f6)"
+    [[ -d "$home" ]] || return 1
+    printf '%s' "$home"
+}
+
+install_apparmor() {
+    local lsm
+    lsm="$(zgrep CONFIG_LSM= /proc/config.gz | cut -d= -f2 | sed 's/,bpf/,apparmor&/' | tr -d \")"
+    echo "lsm=$lsm security=apparmor audit=1 audit_backlog_limit=256" > /etc/cmdline.d/security.conf
+    groupadd -r audit
+    pacman -Sq --noconfirm --needed apparmor python-notify2 python-psutil
+    sed -i '/^log_group =/s/=.*/= audit/' /etc/audit/auditd.conf
+    sed -i '/^#*write-cache/s/^#//' /etc/apparmor/parser.conf
+    systemctl enable apparmor auditd
+    apparmor_notify "$UNAME"
+}
+
+# The apparmor-notify will be enabled for user $1, if the user exists, 
+# or after reboot by the desktop-install command, 
+# when we know user's home exists (e.g. on systemd-homed)
+apparmor_notify() {
+    local user home
+    user="$(is_user -p "$1")"
+    home="$(home_of "$user")"
+    if [[ -d  "$home" && ! -s "$home/.config/autostart/apparmor-notify.desktop" ]]; then
+        [[ -d "${home}/.config/autostart" ]] || mkdir -p "${home}/.config/autostart"
+        echo \
+"[Desktop Entry]
+Type=Application
+Name=AppArmor Notify
+Comment=Receive on screen notifications of AppArmor denials
+TryExec=aa-notify
+Exec=aa-notify -p -s 1 -w 60 -f /var/log/audit/audit.log
+StartupNotify=false
+NoDisplay=true" > "${home}/.config/autostart/apparmor-notify.desktop"
+        chown -R "$user": "${home}/.config"
+        usermod -aG audit "$user"
+    fi
+}
+
+# Create new Ed25519 SSH key for user $1, if no ~/.ssh folder pre-exist
+create_ssh_for() {
+    local user home msg ssh_pw ssh_pw_again key
+    user=$(is_user -p "$1")
+    home="$(home_of "$user")"
+    if [[ -n "$user" && -d "$home" && ! -d "$home/.ssh" ]]; then
+        install -dm700 --owner="$user" --group="$user" "$home/.ssh"
+        if [[ $SET_SSH_KEY_PASSWORD ]]; then
+            echo
+            while :; do
+                msg="Enter SSH key passphrase for user $user (empty for no passphrase):"
+                read -r -s -p "$msg" ssh_pw; echo
+                read -r -s -p "Enter same passphrase again:" ssh_pw_again; echo
+                [[ $ssh_pw == "$ssh_pw_again" ]] && break
+                echo -e "\nError: Passphrases did not match.\n"
+            done
+            echo
+        fi
+        ssh-keygen -t ed25519 -f "$home/.ssh/id_ed25519" -q -C "$user@$(head -1 /etc/hostname)" -N "$ssh_pw" && echo "Created new SSH key for user $user"
+        # install ssh pub key(s), only if no keys pre-exist
+        if [[ ! -s "$home/.ssh/authorized_keys" ]]; then
+            for key in "${SSH_PUB_KEYS[@]}"; do
+                [[ $key == ssh-*" "* ]] && ! [[ $key =~ void@example ]] && echo "$key" >> "/$home/.ssh/authorized_keys"
+            done
+            [[ -f "$home/.ssh/authorized_keys" ]] && chmod 600 "$home/.ssh/authorized_keys"
+        fi
+        [[ $ssh_pw ]] && pacman -Sq --noconfirm --needed keychain &&
+        echo -e "\n# Uncomment next line to start keychain cacheing your SSH keyphrase\n#eval \$(keychain --eval --quiet --dir \$HOME/.local/share/keychain id_ed25519)" >> "/$home/.bashrc"
+        chown -R "$user": "$home"/{.bashrc,.ssh}
+    fi
+}
+
+setup_ssh() {
+    local f tf
+    [[ -d /etc/ssh ]] || pacman -Sq --noconfirm --needed openssh
+    # Unless they exist, create drop-in directories in /etc/ssh/
+    # Anything in these drop-in directories will take precedence over lines in sshd_config and ssh_config.
+    if [[ ! -d /etc/ssh/sshd_config.d ]]; then
+        mkdir /etc/ssh/sshd_config.d
+        sed -i '/^#Port 22/i Include /etc/ssh/sshd_config.d/*.conf\n' /etc/ssh/sshd_config
+    fi
+    if [[ ! -d /etc/ssh/ssh_config.d ]]; then
+        mkdir /etc/ssh/ssh_config.d
+        sed -i '/^# Host \*/i Include /etc/ssh/ssh_config.d/*.conf\n' /etc/ssh/ssh_config
+    fi
+
+    # Option: Best practice to protect the SSH Server, only root can access the settings
+    #chmod go-rwx /etc/ssh/sshd_config{,.d}
+
+    # Option: Custom SSH Server port. Set whatever port you want, example 2222
+    #sed -i 's/^#\?Port 22/Port 2222/' /etc/ssh/sshd_config
+
+    tf="$(mktemp /tmp/XXXXX)"; (($(stat -c %a /etc/ssh/sshd_config.d) == 700)) || chmod go+r "$tf"
+
+    # SSH password authentication policy
+    f=/etc/ssh/sshd_config.d/10-password-auth.conf 
+    echo \
+"# Allow password authentication only from private ipv4 networks.
+# To always disable SSH password authentication, disable next 3 lines.
+Match Address 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/32
+    PermitRootLogin prohibit-password
+    PasswordAuthentication yes
+
+Match Address all
+    PermitRootLogin no
+    PasswordAuthentication no" > "$tf"
+    # root can login with password only if no other admin user exists
+    is_user "$UNAME" || sed -i s/prohibit-password/yes/ "$tf"
+    cp "$tf" "$f"
+
+    # For using SSH Certificates, prepare for both Host and User Certificates.
+    f=/etc/ssh/sshd_config.d/20-certificates.conf
+    echo \
+"# Path to this host's certificate
+#HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub
+
+# Path to the CA public key for verifying user certificates
+#TrustedUserCAKeys /etc/ssh/ssh_user_key.pub" > "$tf"
+    # Enabling the User CA pub Key, if it is available
+    [[ $SSH_USER_CA_PUB_KEY =~ ^ssh-(dsa|ecdsa|ed25519|rsa)[[:blank:]]+[[:alpha:]]+ ]] && 
+    echo "$SSH_USER_CA_PUB_KEY" > /etc/ssh/ssh_user_key.pub && sed -i 's/^#T/T/' "$tf"
+    cp "$tf" "$f"
+
+    # some Lynis recommendations for SSH Server hardening
+    f=/etc/ssh/sshd_config.d/30-hardening.conf
+    echo \
+"# Some Lynis recommendations for SSH hardening.
+# Comment out any you don't want in your workflow.
+AllowAgentForwarding no
+AllowTcpForwarding no
+ClientAliveCountMax 2
+#LogLevel VERBOSE
+MaxAuthTries 3
+MaxSessions 2
+TCPKeepAlive no" > "$f"
+
+    # some defaults for SSH client
+    f=/etc/ssh/ssh_config.d/90-env.conf
+    echo \
+"# 'Match final all' means these will be applied last.
+# These can be overridden by users own .ssh/config
+
+Match final all
+
+    # Some terminals require setting TERM to something general on most ssh hosts
+    SetEnv TERM=xterm-256color
+
+    ForwardX11Trusted yes" > "$f"
+
+    # For clients in an environment with SSH Host Certificates.
+    # In /etc/ssh/ssh_known_hosts this is available for all users. In some cases this may be undesired.
+    # Alternatively this could also be placed in selected user's .ssh/known_hosts
+    [[ $SSH_CERT_AUTHORITY == "@cert-authority "* ]] && echo "$SSH_CERT_AUTHORITY" > /etc/ssh/ssh_known_hosts
+}
+
+# Usage: set_passwd -u username -p password
+# Sets username's password
+# Unless both username and password are given, this function does nothing.
+# password can be plain or encrypted/hashed using sha512 or yescrypt.
+set_passwd() {
+    local user pw opt a
+    while [[ $1 ]]; do
+        case "$1" in
+            -u)
+                user=$(is_user -p "$2")
+                [[ $user ]] && shift
+                shift;;
+            -p)
+                [[ $2 ]] && pw="$2" && shift
+                shift;;
+            --)
+                shift; break;;
+             *)
+                shift;;
+        esac
+    done
+    [[ -z $user || -z $pw ]] && return
+    opt=
+    a="[./A-Za-z0-9]"
+    # Encrypted password must match one of these regexes (sha512, yescrypt, gost-yescrypt)
+    if [[ $pw =~ \$6\$(rounds=[1-9][0-9]+\$)?$a{1,16}\$$a{86} ]] ||
+       [[ $pw =~ \$y\$$a+\$$a{,86}\$$a{43} ]] ||
+       [[ $pw =~ \$gy\$$a+\$$a{,86}\$$a{43} ]]; then
+       opt="--encrypted"
+    fi
+    chpasswd "$opt" <<< "$user:$pw"
+}
+
+# This UNAME exists only after this point, and only in chroot.
+ask_username() {
+    is_chroot || return
+    echo -e "\n\e[1;33mOnly root can login\e[0m until a user is created."
+    read -rp "To create a user now, enter the username: " UNAME
+}
+
+# Since systemd-homed cannot be initialized in chroot, create a script so that
+# the user can easily create a systemd-homed user account on this system after reboot.
+setup_systemd-homed() {
+    local ds f h r homemnt rootdev rootdevsize
+    # systemd-homed "user"
+    UNAME="${UNAME:-username}"
+    homemnt="$(findmnt -n /home)"
+    if [[ $homemnt ]] && grep -Evq 'subvol=/@home,?|$' <<< "$homemnt"; then
+        ds="" # no need to limit the home size, since it doesn't influence rootfs
+    else
+        rootdev=$(findmnt -n / | awk '{print gensub(/[^A-Za-z0-9/_-].*/,"",1,$2)}')
+        rootdevsize=$(lsblk -nbo fssize "$rootdev")
+        # By default the size of the "systemd-home" is 85% of available space.
+        # Leave at least ROOT_SIZE (or 50%) of disk space to the rootfs
+        # after creating the "home" by limiting the "--disk-size"
+        # of the "home" that systemd-homed will create.
+        if [[ -z $ROOT_SIZE || $root_u == '%' ]]; then
+            ROOT_SIZE=$(( rootdevsize * ${ROOT_SIZE:-50} / 100 / 2**30 + 1)) # GiB, +1 is for "rounding"
+        fi
+        # calculations in KiB (df not very accurate with btrfs)
+        r=$(( ROOT_SIZE * 2**20 )); ds=$(( rootdevsize / 1024 - r ))
+        f=$(df | awk '$NF=="/" {print $4}'); h=$(( f * 85/100 ))
+        (( ds < h )) && ds="--disk-size=${ds}K" || ds=""
+    fi
+    systemctl enable systemd-homed
+    # Cannot start systemd-homed in chroot, so homectl create ... does not work here
+    #[[ $UNAME ]] || ask_username
+    #[[ $UNAME ]] && homectl create $UNAME --real-name="${UNAME^}" -G adm,audio,${APPARMOR:+audit,}kvm,network,rfkill,storage,sys,video,wheel "${ssh_keys[@]}" "$ds"
+    f=/usr/local/bin/create-user
+    echo -n \
+'#!'"/usr/bin/env bash
+
+SSH_PUB_KEYS=(" > "$f"
+
+    for k in "${SSH_PUB_KEYS[@]}"; do [[ $k =~ void@example ]] || printf '"%s" ' "--ssh-authorized-keys='${k}'" >> "$f"; done
+    sed -i '$s/ $//' "$f"
+
+    printf '%s' ")
+
+if [[ -z \$1 || \$1 = username || \$1 = root ]]; then
+  echo -e \"Usage:\\t\$(basename \$0) username\\n\"
+  echo -e \"where 'username' is the name of the user to create with systemd-homed.\\n\"
+  exit 1
+fi
+systemctl is-enabled -q systemd-homed || sudo systemctl -q enable --now systemd-homed
+if [ -e /home/\${1}.home ]; then
+  echo \"User \$1 already exists.\"
+  [ \$(id -un) = \$1 ] || echo \"Please, try to login as \$1\"
+else
+  if  ((\${#SSH_PUB_KEYS[*]} > 0)); then
+    echo -e \"\\nSome SSH Public Keys can be added for user \${1} as authorized keys.\"
+    echo -e \"Check the keys with:\\n\\tgrep '^SSH' \\\$(which \$(basename \$0))\\n\"
+    prompt=\"Add the SSH keys for \${1} [y/N]? \"
+    read -rp \"\$prompt\"
+    [[ \${REPLY,,} =~ y(es)? ]] || SSH_PUB_KEYS=()
+  fi
+  sudo homectl create \$1 --real-name=\"\${1^}\" -G adm,audio,${APPARMOR:+audit,}kvm,network,rfkill,storage,sys,video,wheel \"\${SSH_PUB_KEYS[@]}\" \"$ds\" &&
+  grep -qF create-user /etc/motd && echo \\
+\"##############################################
+#                                            #
+#  To install a desktop or a window manager  #
+#  with some software, you may run:          #
+#                                            #
+#     desktop-install                        #
+#                                            #
+#  and follow the instructions.              #
+#                                            #
+##############################################\" | sudo tee /etc/motd >/dev/null
+  echo -e \"\\nNow logout or reboot, and login as \\e[1;36m\${1}\\e[0m\"
+  echo -e \"You can check user information with:\\n\\n\\thomectl inspect \$1\\n\"
+fi
+" >> "$f"
+    chmod +x "$f"
+}
+
+# Create user UNAME and set root password, or lock root account
+create_user_accounts() {
+    local home
+    if [[ $SYSTEMD_HOMED ]]; then
+        setup_systemd-homed
+    else
+        # Traditional user account
+        if [[ -z "$UNAME" || -z "$MY_PASSWORD" ]]; then
+           UNAME=
+           MY_PASSWORD=
+           ask_username
+        fi
+        if [[ $UNAME ]]; then
+            useradd -mG adm,audio,kvm,network,rfkill,storage,sys,video,wheel "$UNAME"
+            if [[ $MY_PASSWORD ]]; then
+                set_passwd -u "$UNAME" -p "$MY_PASSWORD" 
+            else
+                echo -e "\nEnter new password for \e[1;36m${UNAME}\e[0m"
+                passwd "$UNAME"
+            fi
+            # Create ~/.cache directory (or subvol) in the home of $UNAME
+            # This fills up with junk, like browser caches, and with btrfs
+            # it is very nice that these are not filling up home snapshots.
+            # Also, $HOME/.cache is the XDG_CACHE_HOME by default.
+            home="$(home_of "$UNAME")"
+            if [[ ! -d "$home/.cache" ]]; then
+                detect_btrfs "${home%/*}" && btrfs subvol create "$home/.cache"
+                [[ -d "$home/.cache" ]] || mkdir "$home/.cache"
+                chown "$UNAME": "$home/.cache"
+                chmod 0700 "$home/.cache"
+            fi
+        fi
+    fi
+
+    if [[ $ROOT_PASSWORD ]]; then
+        set_passwd -u "root" -p "$ROOT_PASSWORD"
+    elif [[ -z $LOCK_ROOT_ACCOUNT ]] ||
+         [[ $SYSTEMD_HOMED ]] ||
+         ! is_user "$UNAME" ||
+         ! grep -q "^${UNAME}:\\\$" /etc/shadow ||
+         ! grep -q "^wheel:.*[:,]${UNAME}" /etc/group ||
+         ! grep -qE '^%wheel\s+ALL=\([^)]*\) ALL' /etc/sudoers; then
+        # ROOT_PASSWORD was not set but conditions deem root login necessary.
+        echo -e "\nEnter new password for \e[1;36mroot\e[0m"
+        passwd
+    else
+        passwd -l root
+    fi
+}
+
+# Set XDG paths, which by default are unset
+# and, if present, add HOME/.local/bin, HOME/bin or HOME/.bin into PATH
+# and, set EDITOR to nvim, vim or nano. These are set in /etc/profile.d/env-vars.sh
+setup_profile() {
+    [ -e /etc/profile.d/env-vars.sh ] || cat > /etc/profile.d/env-vars.sh << EOF
+# If any of ~/.local/bin, ~/bin or ~/.bin exists, add it to PATH
+for p in \$HOME/.local/bin \$HOME/bin \$HOME/.bin; do
+  test -d "\$p" && append_path "\$p"
+done
+
+XDG_CONFIG_DIRS=\${XDG_CONFIG_DIRS:-/etc/xdg}
+XDG_DATA_DIRS=\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
+
+# Other XDG home paths
+if [[ \$UID -ge 1000 && -d \$HOME ]]; then
+  XDG_CACHE_HOME=\${XDG_CACHE_HOME:-\${HOME}/.cache}
+  XDG_CONFIG_HOME=\${XDG_CONFIG_HOME:-\${HOME}/.config}
+  XDG_DATA_HOME=\${XDG_DATA_HOME:-\${HOME}/.local/share}
+  XDG_STATE_HOME=\${XDG_STATE_HOME:-\${HOME}/.local/state}
+fi
+
+# Set EDITOR, prefer nvim
+[[ -e /usr/bin/nano ]] && EDITOR=nano
+[[ -e /usr/bin/vim ]] && EDITOR=vim
+[[ -e /usr/bin/nvim ]] && EDITOR=nvim
+
+# Set theme for QT apps
+QT_QPA_PLATFORMTHEME=qt5ct
+
+# Export everything maybe set in this file
+export PATH XDG_CONFIG_DIRS XDG_DATA_DIRS XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME EDITOR QT_QPA_PLATFORMTHEME
+EOF
+}
+
+# Setup systemd-networkd. Config files are created in /etc/systemd/network/
+setup_systemd-networkd() {
+    systemctl enable systemd-networkd
+    # if wlan detected, install iwd
+    ip -br l | grep -q '^wl' && pacman -Sq --noconfirm --needed iwd
+    echo \
+"[Match]
+Name=en*
+Name=eth*
+
+[Network]
+DHCP=yes
+IPv6PrivacyExtensions=yes
+
+[DHCPv4]
+RouteMetric=512
+
+[DHCPv6]
+RouteMetric=512" > /etc/systemd/network/20-ethernet.network
+    echo \
+"[Match]
+Name=wl*
+
+[Network]
+DHCP=yes
+IPv6PrivacyExtensions=yes
+
+[DHCPv4]
+RouteMetric=1024
+
+[DHCPv6]
+RouteMetric=1024" > /etc/systemd/network/20-wireless.network
+    echo \
+"[Match]
+Name=ww*
+
+[Network]
+DHCP=yes
+IPv6PrivacyExtensions=yes
+
+[DHCPv4]
+RouteMetric=2048
+
+[DHCPv6]
+RouteMetric=2048" > /etc/systemd/network/20-wwan.network
+    echo \
+"[NetDev]
+Name=br0
+Kind=bridge" > /etc/systemd/network/br0.netdev
+    echo \
+"# Set the Name to the interface (en*) you want to bind to br0 and
+# remove all matches of that interface from other *.network files.
+[Match]
+Name=enxx
+
+[Network]
+Bridge=br0" > /etc/systemd/network/10-br0-bind.network
+    echo \
+"[Match]
+Name=br0
+
+[Network]
+DHCP=ipv4" > /etc/systemd/network/11-br0-dhcp.network
+}
+
+# DNS is handled by systemd-resolved
+setup_dns() {
+    [[ -d /etc/systemd/resolved.conf.d ]] || mkdir /etc/systemd/resolved.conf.d
+    echo \
+"[Resolve]
+Cache=no-negative" > /etc/systemd/resolved.conf.d/cache.conf
+    systemctl enable systemd-resolved 
+}
+
+# NetworkManager
+setup_networkmanager() {
+    pacman -Sq --noconfirm --needed networkmanager network-manager-applet networkmanager-openvpn
+    # if wlan is detected, install both wpa_supplicant and iwd, set iwd as the default backend
+    ip -br l | grep -q '^wl' && pacman -Sq --noconfirm --needed wpa_supplicant iwd &&
+        echo  \
+"[connection]
+wifi.powersave = 2" > /etc/NetworkManager/conf.d/wifi_powersave-off.conf &&
+        echo \
+"[device]
+wifi.backend=iwd" > /etc/NetworkManager/conf.d/wifi_backend.conf
+    # setup dns to systemd-resolved
+    echo \
+"[main]
+dns=systemd-resolved" > /etc/NetworkManager/conf.d/dns.conf
+    systemctl enable NetworkManager
+}
+
+# Install zram-generator to create zram swap, 20% of RAM, max. 2 GiB, lz4 compressed (fastest)
+# After reboot /dev/zram0 will be active as swap, which can be verfied with swapon
+setup_zram() {
+    pacman -Sq --noconfirm --needed zram-generator
+    echo \
+"[zram0]
+zram-fraction = 0.2
+max-zram-size = 2048
+compression-algorithm = lz4" > /etc/systemd/zram-generator.conf
+}
+
+# Disable hibernation with polkit rule
+disable_hibernation() {
+    install -dm 0755 /etc/polkit-1/rules.d
+    echo \
+"polkit.addRule(function(action, subject) {
+    if (action.id == \"org.freedesktop.login1.hibernate\" ||
+        action.id == \"org.freedesktop.login1.hibernate-multiple-sessions\")
+    {
+        return polkit.Result.NO;
+    }
+});" > /etc/polkit-1/rules.d/10-disable-hibernation.rules
+}
+
+# Enable sudo for members of group wheel
+# and set some useful default env_keep vars.
+# Always check with visudo -c after messing with the /etc/sudoers file.
+setup_sudo() {
+    sed -Ei '/%wheel\s+ALL=\([^)]*\)\s+ALL/s/^#\s*//' /etc/sudoers
+    sed -i '/# Defaults log_output/,/^$/s/^$/Defaults env_keep += "EDITOR SSH_CLIENT SSH_CONNECTION SSH_TTY SSH_AUTH_SOCK"\n&/' /etc/sudoers
+    visudo -cq && echo -e "\nEnabling sudo for members of group 'wheel'" || EDITOR=vim visudo
+}
+
+# Robust base gpg.conf for all users in skel
+setup_gpg() {
+    mkdir -m700 /etc/skel/.gnupg
+    echo \
+"# https://www.gnupg.org/documentation/manuals/gnupg/GPG-Configuration-Options.html
+# https://www.gnupg.org/documentation/manuals/gnupg/GPG-Esoteric-Options.html
+
+# Use these as cipher
+personal-cipher-preferences AES256 AES192 AES
+# Use these as digest
+personal-digest-preferences SHA512 SHA384 SHA256
+# Use these for compression
+personal-compress-preferences ZLIB BZIP2 ZIP Uncompressed
+# Default preferences for new keys
+default-preference-list SHA512 SHA384 SHA256 AES256 AES192 AES ZLIB BZIP2 ZIP Uncompressed
+# Digest to sign keys
+cert-digest-algo SHA512
+# Digest for symmetric ops
+s2k-digest-algo SHA512
+# Cipher for symmetric ops
+s2k-cipher-algo AES256
+# UTF-8 support for compatibility
+charset utf-8
+# Show Unix timestamps
+#fixed-list-mode
+# No comments in signature
+#no-comments
+# No version in output
+#no-emit-version
+# Disable banner
+#no-greeting
+# Long hexidecimal key format
+keyid-format 0xlong
+# Display UID validity
+list-options show-uid-validity
+verify-options show-uid-validity
+# Show expired subkeys
+#list-options show-unusable-subkeys
+# Display all keys and their fingerprints
+with-fingerprint
+# Display key origins and updates
+#with-key-origin
+# Cross-certify subkeys are present and valid
+#require-cross-certification
+# Disable caching of passphrase for symmetrical ops
+no-symkey-cache
+# Enable smartcard
+#use-agent
+# Disable recipient key ID in messages
+#throw-keyids
+# Default/trusted key ID to use (helpful with throw-keyids)
+# Replace 0xABC... with your preferred key ID
+#default-key 0xABC...
+#trusted-key 0xABC...
+# Group recipient keys (preferred ID last)
+#group keygroup = 0xFF00000000000001 0xFF00000000000002 0xABC...
+# Verbose output
+#verbose
+
+# Keyservers
+#keyserver hkps://keys.openpgp.org
+#keyserver hkps://keyserver.ubuntu.com
+#keyserver hkps://pgp.mit.edu" > /etc/skel/.gnupg/gpg.conf
+    chmod 640 /etc/skel/.gnupg/gpg.conf
+}
+
+# Remove the temp user if that user was created, and clear sudoers.d
+clear_tmp_user() {
+    if is_user "$1"; then
+        [[ $1 == "$UNAME" ]] || userdel -rf "$1" &>/dev/null
+    fi
+    rm -f /etc/sudoers.d/tmp-user
+}
+
+# aur_install [pkg ...]
+#   pkg   Package (or multiple packages) to install from the AUR.
+aur_install() {
+    local pkg user
+    user=$(is_user -p "$UNAME")
+    if [[ -z $user ]]; then
+        # Create temp user with required permissions
+        user="$(tr -dc 'a-z' < /dev/urandom | head -c 12)"
+        useradd -G wheel "$user" || return 1
+    fi
+    echo "${user} ALL=(root) NOPASSWD: /usr/bin/pacman" > /etc/sudoers.d/tmp-user && chmod 0440 /etc/sudoers.d/tmp-user
+
+    while [[ $1 ]]; do
+        pkg="$1"
+        git clone https://aur.archlinux.org/"${pkg}".git "/tmp/$pkg" && chmod o+w "/tmp/$pkg"
+        pushd "/tmp/$pkg" && su -m "$user" -c 'makepkg -sic --noconfirm'; popd || break
+        shift
+    done
+    clear_tmp_user "$user"
+}
+
+
+# Install QEMU, virt-manager and cockpit, if virtualization is active in BIOS/UEFI (size installed is ~1 GiB)
+install_qemu() {
+    local f images
+    if grep -Eq '(vmx|svm)' /proc/cpuinfo; then
+        pacman -Sq --needed --noconfirm qemu-desktop qemu-emulators-full edk2-ovmf libvirt dmidecode dnsmasq bridge-utils virt-manager virt-viewer swtpm cockpit cockpit-machines pcp cockpit-pcp libguestfs
+        [[ $SYSTEMD_HOMED ]] && systemctl -q is-enabled systemd-homed && sed -i 's/,kvm,/,kvm,libvirt,/' /usr/local/bin/create-user
+        is_user "$UNAME" && usermod -aG libvirt "$UNAME"
+        # && sed -i -e '/^#*user =/s/=.*/= "root"/;/^#*user =/s/^#//' -e '/^#*group =/s=.*/= "wheel"/;/^#*group =/s/^#//' /etc/libvirt/qemu.conf
+        install -dm755 /etc/libvirt/hooks/qemu.d  # preparation for e.g. GPU passthrough
+        virsh net-autostart default
+
+        # enable libvirtd and cockpit (i.e. localhost:9090)
+        systemctl enable libvirtd.socket cockpit.socket pmcd pmlogger
+
+        if detect_btrfs; then
+            # On btrfs /var/lib/libvirt/images would be included in root snapshots,
+            # and vm images would be waste of space in those snapshots.
+            # Move them to a new subvolume in the user's home or e.g. /var/...
+            images=/var/VM-images
+            [[ -d $images ]] || btrfs subvol create "$images"
+            chattr +C "$images"  # nodatacow
+            chown :libvirt "$images"
+            echo \
+"<!--
+WARNING: THIS IS AN AUTO-GENERATED FILE. CHANGES TO IT ARE LIKELY TO BE
+OVERWRITTEN AND LOST. Changes to this xml configuration should be made using:
+virsh pool-edit default
+or other application using the libvirt API.
+-->
+
+<pool type='dir'>
+<name>default</name>
+<uuid>$(uuidgen)</uuid>
+<capacity unit='bytes'>0</capacity>
+<allocation unit='bytes'>0</allocation>
+<available unit='bytes'>0</available>
+<source>
+</source>
+<target>
+<path>${images}</path>
+<permissions>
+  <mode>0770</mode>
+  <owner>0</owner>
+  <group>$(grep "libvirt:" /etc/group | cut -d: -f3)</group>
+</permissions>
+</target>
+</pool>" > /etc/libvirt/storage/default.xml
+            chmod 600 /etc/libvirt/storage/default.xml
+            ln -sf /etc/libvirt/storage/default.xml /etc/libvirt/storage/autostart/default.xml
+        fi
+        # Make VMs easily accessible with SSH (only if we aren't in a VM)
+        f=/etc/ssh/ssh_config.d/10-qemu-virbr.conf
+        [[ -d "$(dirname "$f")" ]] && { systemd-detect-virt -q || echo -e "Host 192.168.122.*\n    BindInterface virbr0\n    StrictHostKeyChecking off" > "$f"; }
+    fi
+}
+
+enable_firewall() {
+    local ssh_port f
+    [[ -f /etc/default/ufw ]] || pacman -Sq --noconfirm --needed gufw
+    # Only ssh (port 22/tcp) allowed by default, checking port from sshd_config
+    for f in /etc/ssh/sshd_config{.d/*.conf,}; do
+        ssh_port="$(awk '/^\s*Port / {print $2; exit}' "$f")"
+        [[ $ssh_port =~ ^[0-9]+$ ]] && break
+    done
+    [[ $ssh_port =~ ^[0-9]+$ ]] || ssh_port=22
+    ufw --force reset &> /dev/null
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw limit "$ssh_port"/tcp
+    ufw enable
+    systemctl enable ufw
+}
+
+install_intel_gpu_driver() {
+    # Do NOT install xf86-video-intel. Use only mesa drivers for Intel.
+    # On old Intel (pre 3rd Gen IvyBridge/2012 cpu), switch mesa to mesa-amber, which does NOT support vulkan
+    grep -Eq '(rd|th) Gen Intel' /proc/cpuinfo && PKGLIST=(mesa vulkan-intel) || PKGLIST=(mesa-amber)
+    pacman -Sq --noconfirm --needed "${PKGLIST[@]}" mesa-utils mesa-vdpau \
+        libva-mesa-driver libva-utils intel-media-sdk intel-gpu-tools
+    # You may want to add i915 to MODULES in /etc/mkinitcpio.conf
+    sed -i '/^MODULES=/s/)/ i915)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+}
+
+install_amdgpu_driver() {
+    pacman -Sq --noconfirm --needed mesa xf86-video-amdgpu mesa-utils \
+        vulkan-radeon libva-mesa-driver libva-utils mesa-vdpau radeontop
+    sed -i '/^MODULES=/s/)/ amdgpu)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+    # Linux AMDGPU Control Application is in the AUR
+    aur_install lact
+    systemctl enable lactd 
+}
+
+nvidia_boot_settings() {
+    # if already done, nothing to do
+    grep -q '^MODULES=.*nvidia' /etc/mkinitcpio.conf && return
+    echo -e "blacklist nouveau\noptions nouveau modeset=0" > /etc/modprobe.d/blacklist-nouveau.conf
+    echo "nvidia-drm.modeset=1" > /etc/cmdline.d/nvidia.conf
+    sed -i '/^MODULES=/s/)/ nvidia nvidia_modeset nvidia_uvm nvidia_drm)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+}
+
+# AUR is needed for older model Nvidia GPU drivers. THESE MAY OR MAY NOT WORK.
+# Dkms versions are installed.
+# Many prefer the linux-lts kernel with Nvidia, less chance of problems, perhaps.
+install_nvidia_driver() {
+    local nvidia_hook f k
+    sed -i '/^#\[multilib\]/,/^$/s/^#//' /etc/pacman.conf # enable multilib
+    pacman -Sy
+    if lspci | grep -Eiq '(VGA|3D).*NVIDIA.*(GTX? (9|10)[0-9]{2}|RTX|MX[1-4]|TITAN)'; then
+        pacman -Sq --noconfirm --needed nvidia-dkms nvidia-utils opencl-nvidia nvidia-settings libglvnd nvtop \
+            lib32-libglvnd lib32-nvidia-utils lib32-opencl-nvidia
+        nvidia_hook=1
+    elif lspci | grep -Eiq '(VGA|3D).*NVIDIA.*GTX? ([78][0-9]{2}|6[0-9]{2}[^M])'; then
+        aur_install nvidia-470xx-dkms nvidia-470xx-utils nvidia-470xx-settings lib32-nvidia-470xx-utils
+        nvidia_hook=1
+    elif lspci | grep -Eiq '(VGA|3D).*NVIDIA.*GTX? ([45][0-9]{2}|6[0-9]{2}M)'; then
+        aur_install nvidia-390xx-dkms nvidia-390xx-utils nvidia-390xx-settings lib32-nvidia-390xx-utils
+        nvidia_hook=1
+    elif lspci | grep -Eiq '(VGA|3D).*NVIDIA.*GT?X? ?[123][0-9]{2}[^0]'; then
+        aur_install nvidia-340xx-dkms nvidia-340xx-utils nvidia-340xx-settings lib32-nvidia-340xx-utils
+        echo "ACTION==\"add\", DEVPATH==\"/bus/pci/drivers/nvidia\", RUN+=\"/usr/bin/nvidia-modprobe -c 0 -u\"" > /etc/udev/rules.d/70-nvidia.rules
+        nvidia_hook=1
+    fi
+    if [[ $nvidia_hook ]]; then
+        nvidia_boot_settings
+        f=/etc/pacman.d/hooks/nvidia.hook
+        [[ -d "$(dirname "$f")" ]] || mkdir -p "$(dirname "$f")"
+        echo \
+"[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = nvidia-dkms
+
+[Action]
+Description = Update NVIDIA module in initcpio
+Depends = mkinitcpio
+When = PostTransaction
+NeedsTargets
+Exec = /bin/sh -c 'while read -r trg; do case \$trg in linux|linux-lts|linux-hardened|linux-rt|linux-rt-lts|linux-zen) exit 0; esac; done; /usr/bin/mkinitcpio -P'" > "$f"
+        for k in "${KERNEL[@]}"; do 
+            sed -i "/^Target = nvidia/a Target = $k" "$f"
+        done
+    fi
+}
+
+# Edit some config files in the home of $1.
+# Does nothing unless $1 is a valid user on this system.
+personalize_home() {
+    local user home
+    user="$(is_user -p "$1")"
+    home="$(home_of "$user")"
+    [[ -d "$home" ]] || return
+
+    # Personal global git settings
+    [[ -n "$GIT_CONFIG" && ! -s "$home/.config/git/config" ]] && mkdir -p "$home/.config/git" &&
+        echo -e "$GIT_CONFIG" | awk 'NR==1 && $1; NR>1' > "$home/.config/git/config"
+
+    # lf config
+    [[ -e /usr/bin/lf && ! -s "$home/.config/lf/lfrc" ]] && mkdir -p "$home/.config/lf" &&
+        cp -a /usr/share/doc/lf/lfrc.example "$home/.config/lf/lfrc"
+
+    chown -R "$user": "$home/.config"
+
+    # some essentials in .bashrc
+    echo \
+"alias ll='ls -lh'
+
+GPG_TTY=\$(tty)
+export GPG_TTY" >> "$home/.bashrc"
+    
+    # If neofetch is installed, enable it for user UNAME
+    command -v neofetch &> /dev/null && ! grep -qxF neofetch "$home/.bashrc" &&
+        echo -e "\n# Enable neofetch\nneofetch" >> "$home/.bashrc"
+    # If pfetch is installed, enable it, or make enabling it easy for user UNAME
+    command -v pfetch &> /dev/null && ! grep -qwF pfetch "$home/.bashrc" &&
+        echo -e "\n# Enable pfetch\n#pfetch" >> "$home/.bashrc" &&
+        ! command -v neofetch &> /dev/null && sed -i '/^#pfetch/s/^#//' "$home/.bashrc"
+    chown "$user": "$home/.bashrc"
+}
+
+# This is the "main" function when run inside chroot
+inside_chroot() {
+    local osprober virt f pkgs
+
+    [[ -e "/usr/share/zoneinfo/${LOCALTIME:-UTC}" ]] && ln -sf "/usr/share/zoneinfo/${LOCALTIME:-UTC}" /etc/localtime
+    hwclock --systohc --utc
+    LOCALE="${LOCALE:-en_US}"
+    [[ $LOCALE =~ en_US ]] || LOCALE="${LOCALE}|en_US"
+    sed -Ei "s/^#($LOCALE)(.*UTF-8.*)/\1\2/" /etc/locale.gen && locale-gen
+    echo LANG="${LOCALE%%'|'*}.UTF-8" > /etc/locale.conf
+    echo KEYMAP="${KEYMAP:-us}" > /etc/vconsole.conf
+    echo "$HOSTNAME" > /etc/hostname
+    echo -e "127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.1.1\t${HOSTNAME}.localdomain\t${HOSTNAME}" >> /etc/hosts
+    sed -Ei '/COMPRESSION="zstd"/s/^#//; s/^#?(COMPRESSION_OPTIONS)=.*/\1=(-6 --long)/; /^#MODULES_DECOM/s/^#//' /etc/mkinitcpio.conf
+    systemctl enable systemd-timesyncd
+
+    # for pacman 6+
+    sed -Ei 's/^#?(ParallelDownloads).*/\1 = 5/; s/^#Color$/Color\nILoveCandy/; /^#VerbosePkgLists/s/^#//' /etc/pacman.conf
+    rm -f /var/lib/pacman/db.lck
+
+    detect_btrfs || unset BTRFS
+    # When doing a rollback on btrfs, snapper sets the default subvolume, but yabsnap does not.
+    # Unless the default subvolume is set, it MUST be specified to the kernel (see bootloader install functions)
+    #detect_btrfs && btrfs subvol set-default "$(btrfs inspect-internal rootid /)" /
+
+    read -r DISK RNAME crypt <<<"$(lsblk -no name,path,type,mountpoint | awk '$3=="disk" {disk=$2} $3=="crypt" {c=substr($1,3); n=$2} $4=="/" || $4 ~ "/var|/home|/swap|snapshot" {if (!d || $4=="/") d=disk; if (!n) n=$2} END {print (d)?d:disk,(n)?n:$2,(c)?c:"/"}')"
+    CRYPTVOL="${crypt%/}"
+    detect_lvm -q "${CRYPTVOL:+$RNAME}" && RNAME="$(lvs | awk '$1=="root" {print "/dev/" $2 "/" $1}')"
+
+    UUID="$(detect_root --)" || { echo -e "Fatal error: cannot locate root partition!"; exit 1; }
+    is_efi && detect_esp
+    [[ $BOOT_LOADER =~ os-?prober ]] && osprober="--os-prober" && BOOT_LOADER="${BOOT_LOADER%,*}" || osprober=
+    [[ -d /etc/cmdline.d ]] || mkdir /etc/cmdline.d
+
+    # DEBUG
+    #lsblk >&2 && blkid >&2 && debug_echo -e "DISK: $DISK\n${ESP:+EFI esp: $EFI}\nRNAME: $RNAME\nUUID: $UUID\n${CRYPTVOL:+crypt: $CRYPTVOL\n}boot-loader: $BOOT_LOADER" && read -p "Press enter to continue"
+
+    # Now we have all parameters needed to install the boot loader.
+    # --timeout <t>    <t> can be selected according to taste. If omitted, the default is 5 seconds.
+    #                  All boot loaders except EFISTUB adhere to the timeout.
+    # --quiet          Silent boot, no kernel messages except errors (i.e. loglevel=3)
+    # --minimal-theme  Add if you install rEFInd and want the rEFInd-minimal theme.
+    install_bootloader --timeout 5 --quiet --bootloader "$BOOT_LOADER" --disk "$DISK" --uuid "$UUID" --rootname "$RNAME" ${ESP:+-e "$EFI"} ${CRYPTVOL:+-c "$CRYPTVOL"} "$osprober" ${SECURE_BOOT:+--secureboot}
+
+    if detect_btrfs; then
+        btrfs subvol create /var/lib/containers # for podman
+        #is_efi && detect_esp -- && echo "# This is the original /etc/fstab" > "$EFI/fstab.txt" && cat /etc/fstab >> "$EFI/fstab.txt"
+        # The following changes to /etc/mkinitcpio.conf are for all btrfs installations:
+        sed -i -e '/^BINARIES=/s|()|(/usr/bin/btrfs)|' -e '/^HOOKS=/s/ fsck//' /etc/mkinitcpio.conf
+        grep -q '^HOOKS=.* systemd ' /etc/mkinitcpio.conf &&
+          sed -i '/^MODULES=/s/()/(zstd)/' /etc/mkinitcpio.conf ||
+          sed -i '/^MODULES=/s/()/(btrfs zstd)/' /etc/mkinitcpio.conf
+    fi
+    
+    # Packages in base.list will be installed always
+    pkgs="$(dirname "$0")/pkgs"
+    read_pkglist -q "$pkgs/base.list"
+
+    detect_btrfs && PKGLIST+=(compsize)
+
+    # Install everything in the pkglist
+    pacman -Sq --noconfirm --needed "${PKGLIST[@]}"
+
+    if [[ $SYSTEMD_NETWORKD ]]; then
+        setup_systemd-networkd
+    else
+        setup_networkmanager
+    fi
+    setup_dns
+    
+    pacman -Q dhcpcd &>/dev/null && systemctl enable dhcpcd
+    systemctl enable sshd avahi-daemon linux-modules-cleanup archlinux-keyring-wkd-sync.timer
+    sed -i '/hosts:/s/ resolve/ mdns_minimal [NOTFOUND=return]&/' /etc/nsswitch.conf
+
+    setup_sudo
+    setup_gpg
+    setup_ssh
+    setup_profile
+
+    create_user_accounts
+    create_ssh_for "$UNAME"
+
+    virt="$(systemd-detect-virt)"
+    [[ $virt == kvm ]] && pacman -Sq --noconfirm --needed qemu-guest-agent xf86-video-qxl spice-vdagent &&
+        echo -e "# for qxl support\nqxl\nbochs_drm" > /etc/modules-load.d/qxl.conf
+    [[ $virt == oracle ]] && pacman -Sq --noconfirm --needed xf86-video-vmware virtualbox-guest-utils &&
+        systemctl enable vboxservice
+    [[ $virt == vmware ]] && pacman -Sq --noconfirm --needed xf86-video-vmware xf86-input-vmmouse
+
+    if [[ $virt == none ]]; then
+        # Packages in non-vm.list will be installed on real hardware only (NOT in virtual machines).
+        # Notice also graphics drivers below. Do not add graphics drivers into non-vm.list
+        read_pkglist -q "$pkgs/non-vm.list"
+        ((${#PKGLIST[*]})) && pacman -Sq --noconfirm --needed "${PKGLIST[@]}"
+        pacman -Q cups &>/dev/null && systemctl enable cups.socket
+        pacman -Q bluez &>/dev/null && systemctl enable bluetooth
+
+        # Option: acpi https://wiki.archlinux.org/title/ACPI_modules and https://wiki.archlinux.org/title/Acpid
+        pacman -Sq --noconfirm --needed acpi acpi_call-dkms acpid # && systemctl enable acpid
+
+        (( $(lsblk -dno path,rota | grep -Ev '(loop|sr|zram)' | grep -c 0$) > 0 )) && systemctl enable fstrim.timer
+
+        # thermald is for Intel CPUs only
+        [[ -e /boot/intel-ucode.img ]] && pacman -Sq --noconfirm --needed thermald && systemctl enable thermald
+
+        # GPU drivers
+        if lspci | grep -Eiq '(VGA|3D).*Intel ' && [[ -z "$INTELGPU_DISABLE" ]]; then
+            install_intel_gpu_driver
+        fi
+        if lspci | grep -Eiq '(VGA|3D).*AMD' && [[ -z "$AMDGPU_DISABLE" ]]; then
+            install_amdgpu_driver
+        fi
+        if lspci | grep -Eiq '(VGA|3D).*NVIDIA' && [[ -z "$NVIDIA_DISABLE" ]]; then
+            install_nvidia_driver
+        fi
+    fi
+
+    # If no swap specified, create zram swap
+    if [[ -z $SWAP_SIZE ]] || (( SWAP_SIZE == 0 )); then
+        setup_zram
+    fi
+
+    # If not enough swap space, disable hibernation by default
+    if [[ -z "$SWAP_SIZE" ]] || (( SWAP_SIZE < $(free -"${swap_u,}" | awk '/Mem:/ {print $2}') )); then
+        disable_hibernation
+    fi
+
+    # Apparmor is now safe to install, when $UNAME (may) exist
+    [[ $APPARMOR ]] && install_apparmor
+
+    echo "PROMPT='%n@%m %~ %# '" >> /root/.zshrc
+    # Option: set zsh as default shell for root
+    #[[ -e /usr/bin/zsh ]] && chsh -s /usr/bin/zsh
+    
+    # Install the qemu-suite, unless we are in a virtual machine (i.e. no nested virtualization)
+    systemd-detect-virt -q || install_qemu
+
+    # Install AUR packages from aur.list
+    read_pkglist -q "$pkgs/aur.list"
+    aur_install "${PKGLIST[@]}"
+
+    # Fix output order in paru.conf
+    [ -s /etc/paru.conf ] && sed -i "/^#BottomUp/s/^#//" /etc/paru.conf
+
+    # Create command "desktop-install", and set the default screen resolution
+    # and activate the zsh-install command, which is needed by desktop-install.
+    f=/usr/local/bin/desktop-install
+    [[ -s $f ]] && sed -i "/^VIRT_RESOLUTION=/s/=.*/=${VIRT_RESOLUTION:-1920x1080}/" "$f" && 
+    chmod -f +x "$f" "$(dirname "$f")/zsh-install"
+
+    [[ $FIREWALL ]] && enable_firewall
+
+    # Option: set default umask 027
+    #sed -i '/^UMASK/s/022/027/' /etc/login.defs
+
+    # Install personal items, like the git config, and enable neofetch or pfetch
+    # If e.g. systemd-homed, the function cannot do anything.
+    personalize_home "$UNAME"
+
+    # Shorten some long shutdown delays (default timeout is 90s)
+    mkdir -m 0755 /etc/systemd/{system,user}.conf.d
+    echo -e "[Manager]\nDefaultTimeoutStopSec=10s" | tee /etc/systemd/system.conf.d/system.conf > /etc/systemd/user.conf.d/user.conf
+
+    # Set reflector default args. Please, verify these settings before starting the reflector service or timer
+    f=/etc/xdg/reflector/reflector.conf
+    [[ -e "$f" ]] && sed -i "/^# --country/a --country $(curl -s http://ip-api.com/line?fields=country)" "$f" &&
+      sed -i 's/^--sort /# &/;/^# --sort/a # Sort by download speed\n--sort rate' "$f"    
+} # inside_chroot() function ends
+
+########################################################################
+
+validate() {
+    [[ -z "$1" || $1 = 0 || ${1,,} = no || ${1,,} = off || ${1,,} = "false" ]] && echo || echo "$@"
+}
+
+validate_root_size() {
+    case "${ROOT_SIZE: -1}" in
+        t|T)
+            root_u='T' ;;
+          %)
+            root_u='%' ;;
+          *)
+            root_u='G' ;;
+    esac
+    ROOT_SIZE=$(awk "BEGIN {print int(${ROOT_SIZE%%\%*})}")
+    [[ $root_u == T ]] && ROOT_SIZE=$((ROOT_SIZE * 1024)) && root_u='G'
+    # The rest of this script assumes ROOT_SIZE is always in GiB or in %
+    ((ROOT_SIZE > 0)) || unset ROOT_SIZE root_u
+}
+
+validate_swap_size() {
+    case "${SWAP_SIZE: -1}" in
+        k|K)
+            swap_u='K' ;;
+        m|M)
+            swap_u='M' ;;
+        h|H)
+            SWAP_SIZE=$(free -m|awk '/Mem:/ {if ($2<10240) print 512+$2; else print 1024+$2}')
+            ((SWAP_SIZE>10240)) && swap_u='G' || swap_u='M'
+            [[ $swap_u == G ]] && SWAP_SIZE=$((SWAP_SIZE / 1024))
+            ;;
+        *)
+            swap_u='G' ;;
+    esac
+    SWAP_SIZE=$(awk "BEGIN {print int(${SWAP_SIZE%%\%*})}")
+    ((SWAP_SIZE > 0)) || unset SWAP_SIZE swap_u
+}
+
+validate_conf() {
+    [[ $HOSTNAME ]] || HOSTNAME="arch-$(tr -dc a-z < /dev/urandom | head -c 3)"
+    [[ $LOCALTIME ]] || LOCALTIME="$(curl -s http://ip-api.com/line?fields=timezone)"
+    [[ $UNAME == "root" ]] && unset UNAME
+    declare -p KERNEL | grep -q 'declare -a' || KERNEL=("$KERNEL")
+    (( ${#KERNEL[*]} )) || KERNEL=(linux)
+    LOCK_ROOT_ACCOUNT="$(validate "$LOCK_ROOT_ACCOUNT")"
+    SWAP_PARTITION="$(validate "$SWAP_PARTITION")"
+    SET_SSH_KEY_PASSWORD="$(validate "$SET_SSH_KEY_PASSWORD")"
+    SECURE_BOOT="$(validate "$SECURE_BOOT")"
+    ENCRYPT="$(validate "$ENCRYPT")"
+    BTRFS="$(validate "$BTRFS")"
+    SYSTEMD_HOMED="$(validate "$SYSTEMD_HOMED")"
+    SYSTEMD_NETWORKD="$(validate "$SYSTEMD_NETWORKD")"
+    HOME_PARTITION="$(validate "$HOME_PARTITION")"
+    APPARMOR="$(validate "$APPARMOR")"
+    FIREWALL="$(validate "$FIREWALL")"
+    VM_IS_ALWAYS_SSD="$(validate "$VM_IS_ALWAYS_SSD")"
+    INTELGPU_DISABLE="$(validate "$INTELGPU_DISABLE")"
+    AMDGPU_DISABLE="$(validate "$AMDGPU_DISABLE")"
+    NVIDIA_DISABLE="$(validate "$NVIDIA_DISABLE")"
+    [[ ${BOOT_LOADER,,} =~ ^(efistub|systemd-boot|refind|grub|grub,os-?prober)$ ]] || BOOT_LOADER=grub
+    [[ $HOME_PARTITION ]] && ROOT_SIZE=${ROOT_SIZE:-"50%"}
+    [[ $ROOT_SIZE ]] && validate_root_size
+    [[ $SWAP_SIZE ]] && validate_swap_size
+}
+
+read_base_config() {
+    # import main .conf file. There should always be a "base" arch-install.conf file in the same directory as the script.
+    [[ -s "${0%.*}.conf" ]] && _CONF="${0%.*}.conf" || _CONF="$(dirname "$0")"/arch-install.conf
+    [[ -s $_CONF ]] && . "$_CONF" || { echo "Error! arch-install.conf: file not found."; exit 1; }
+    validate_conf
+    # initialize these
+    SAVE_PARTS=()
+    CUSTOM_CONF=()
+    YES=
+}
+
+# custom_conf "path"
+# "Path" can be either a directory, which should contain *.conf file(s)
+# or "path" can be a filepath to a specific config file of any name. 
+# These config files are then sourced and validated.
+custom_conf() {
+    local f conf=()
+    [[ $1 ]] || return 0
+    [[ -d "$1" ]] && for f in $(find "$1" -maxdepth 1 -type f -name "*.conf" | sort); do . "$f" && conf+=("$f"); done
+    [[ -f "$1" ]] && . "$1" && conf+=("$1")
+    (( ${#conf[*]} )) && validate_conf || return 1
+    CUSTOM_CONF+=("${conf[@]}")
+}
+
+
+# check options, read all custom conf files, and start reflector in the background, 
+# unless user chooses not to run reflector (-n)
+check_options() {
+    local args country
+    if ! args=$(getopt -o c:e:i:R:H:hny -l conf:,efi:,root:,home:,country:,no-reflector,help,yes -- "$@"); then
+        echo -e "Check options: $*"
+        exit 1
+    fi
+
+    eval set -- "$args"
+    while [[ $1 ]]; do
+      case "$1" in
+        -n|--no-reflector) 
+                    SKIP_REFLECTOR=yes; shift
+                    ;;
+             -c|--country) 
+                    country="$2"; shift 2
+                    ;;
+                -i|--conf) 
+                    custom_conf "$2" && shift 2 || { echo "Error: Cannot import conf from '$2'."; exit 1; }
+                    ;;
+                 -E|--efi) 
+                    [[ -b "$2" ]] && ESP="$2" && save_with_parents "$2" && shift 2 || { echo "Error: Option $1 must be followed by a valid esp partition path."; exit 1; }
+                    ;;
+                -R|--root) 
+                    [[ -b "$2" ]] && VGPART="$2" && save_with_parents "$2" && shift 2 || { echo "Error: Option $1 must be followed by a valid root partition path."; exit 1; }
+                    ;;
+                -H|--home)
+                    [[ -b "$2" ]] && HOME_PARTITION="$2" && save_with_parents "$2" && shift 2 || { echo "Error: Option $1 must be followed by a valid home partition path."; exit 1; }
+                    ;;
+                -y|--yes)
+                     YES=yes; shift
+                     ;;
+                -h|--help) 
+                    echo -e \
+"
+Usage: $(basename "$0") [options]
+
+options:
+    -i, --conf <conf>
+        Include config file <conf>. This <conf> can be a directory, which should
+        contain one or many *.conf file(s), or a filepath to a specific config 
+        file of any name.
+
+    -n, --no-reflector
+        Skip using reflector to rank the mirrors.
+        Useful when installing e.g. in a VM multiple times while testing settings.
+
+    -c, --country <country>
+        Optionally specify the <country> to use when reflector is ranking mirrors.
+        Normally the country you are in should be detected by http://ip-api.com.
+        You may specify multiple countries separated by commas (,).
+    
+    -E, --efi <partition>
+        Optionally specify the partition to use as the esp i.e. EFI partition.
+        This is obviously only for EFI systems. Legacy MBR systems don't use this.
+        
+    -H, --home <partition>
+        Optionally specify the <partition> to use as the home partition of the 
+        new installation. If you have an old home disk or partition, this is a
+        good place to specify it. Use e.g. 'lsblk -o +path' to find the path to
+        your home partition for this option.
+        If this partition contains a filesystem, it will not be formatted.
+        If this partition is blank, it obviously must be formatted.
+
+    -R, --root <partition>
+        Optionally specify the <partition> or <disk> to use for the target root
+        partition of the new installation. This partition will be formatted.
+        Warning! Don't use this, unless you are absolutely sure it is needed.
+
+    -y, --yes
+        Answer the default automatically to \"safe\" questions.
+
+    -h, --help
+        This help text.
+" | less -FX
+                    shift; exit 0
+                    ;;
+                --) shift; break
+                    ;;
+                 *) shift
+                    ;;
+      esac
+    done
+    if [[ -b "$ESP" ]]; then
+        (( $(esp_size -m) < 128 )) && { echo -e "Error: partition $ESP is too small for an EFI esp on Linux.\nThe esp size should be at least 128 MB."; exit 1; }
+        (( $(esp_size -m) > 2048)) && { p="Size of $ESP is over 2 GiB. Really use $ESP as an EFI esp [y/N]? "; read -rp "$p"; [[ ${REPLY,,} =~ ^y(es)? ]] || remove_saved "$ESP"; }
+        #[[ $(lsblk -no fstype $ESP) == vfat ]]
+    fi
+    if [[ -b "$VGPART" ]]; then
+        DISK="$(dev_on_disk "$VGPART")"
+        [[ $DISK == "$VGPART" ]] && unset VGPART
+    fi
+    # Always add Sweden to get mirror.osbeck.com
+    [[ $country ]] || { country="$(curl -s http://ip-api.com/line?fields=country)"; [[ $country == *"Sweden"* ]] || country="Sweden,${country}"; }
+    [[ $SKIP_REFLECTOR ]] || coproc reflector --country "${country}" --latest 6 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+    
+}
+
+# are we in chroot?
+is_chroot() {
+    [ "$(stat -c %d%i /)" != "$(stat -c %d%i /proc/1/root/.)" ]
+}
+
+user-motd() {
+    local f=/mnt/etc/motd
+    is_chroot && f="${f#/mnt}"
+    cat > "$f" << EOF
+##############################################
+#                                            #
+#  Create a user with:                       #
+#                                            #
+#     create-user username                   #
+#                                            #
+#  where 'username' is the username who      #
+#  to create with systemd-homed.             #
+#                                            #
+##############################################
+EOF
+}
+
+desktop-motd() {
+    local f=/mnt/etc/motd
+    is_chroot && f="${f#/mnt}"
+  cat > "$f" << EOF
+##############################################
+#                                            #
+#  To install a desktop or a window manager  #
+#  with some software, you may run:          #
+#                                            #
+#      desktop-install                       #
+#                                            #
+#  and follow the instructions.              #
+#                                            #
+##############################################
+EOF
+}
+
+# The goodbye messages before reboot/poweroff
+goodbye() {
+    local crypt_part user
+    # Encourage user to backup the LUKS header of the encrypted root partition
+    crypt_part="$(lsblk -no fstype,path "$DISK" | awk '/crypto/ {print $2}')"
+    if [[ $crypt_part ]]; then
+        mkdir /luks-header-backup
+        cryptsetup luksHeaderBackup "$crypt_part" --header-backup-file "/luks-header-backup/luks-header-${crypt_part##*/}.bin"
+        cp -R /luks-header-backup /mnt/
+        echo -e "You should backup the LUKS header for $crypt_part from /luks-header-backup/ to a safe place.\n"
+    fi
+
+    user="$(is_user -p "$UNAME")"
+    echo -e "\nAfter next boot, login as \e[1;36m${user:-root}\e[0m\n"
+    [[ $user ]] && desktop-motd
+    if [[ $SYSTEMD_HOMED ]]; then
+        echo "After logging in, run:"
+        echo -e "\n\tcreate-user ${UNAME:-"<username>"}\n"
+        echo -e "and follow the instructions.\n"
+        user-motd
+    fi
+}
+
+trap exit SIGINT
+
+# Main is two parts: *before* chroot and *inside* chroot
+main() {
+    local f i p cdir
+    read_base_config
+    if is_chroot; then
+        # This part will run, when this script is executed inside chroot
+        # If there are any custom config files, import them also here inside chroot
+        [[ $1 ]] && for f in $(find "$1" -type f | sort -n); do 
+            custom_conf "$f"
+        done
+        [[ $2 ]] && YES="$2"
+        inside_chroot
+        # Execute every scripts/*.sh with bash. We are still in chroot.
+        # Every script gets one arg: $UNAME (if exists as user account, not if e.g. systemd-homed)
+        for f in $(find "$(dirname "$0")"/scripts -type f -name "*.sh" | sort -n); do
+            /usr/bin/bash "$f" "$(is_user -p "$UNAME")"
+        done
+        goodbye
+    else
+        # This part will run, if this script is executed NOT being in chroot.
+        # The script starts here essentially.
+        timedatectl set-ntp true
+        check_options "$@"
+        loadkeys "${KEYMAP:-us}"
+        pacman-key --init
+        pacman-key --populate archlinux
+        pacman -Syq --noconfirm --needed archlinux-keyring
+        
+        # detect, format, mount and do the initial pacstrap
+        prepare_disk
+
+        systemctl is-active sshd -q || systemctl -q start sshd
+        [[ $SSH_CONNECTION ]] || { grep -q 'root:\$[6gy]' /etc/shadow && echo -e "\nYou may connect with SSH:\n\tssh root@$(ip -br a|awk '/UP/ {gsub(/\/.*/,""); print $3}')"; }
+        # This mirrorlist is freshly updated by reflector, so why not use it in the new install too
+        cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
+        # copy this installer and its conf files into the new system
+        cp -a "$(dirname "$0")"/{pkgs,scripts,{arch,desktop,zsh}-install} /mnt/usr/local/bin/ || { echo "Error copying installer to new system."; exit 1; }
+        cp "$_CONF" /mnt/usr/local/bin/ || { echo "Error copying $_CONF to new system."; exit 1; }
+        # copy also your custom conf files into the chroot environment
+        # note that the chroot gets its own private /tmp, so that's out of options
+        cdir="$(mktemp -d /mnt/usr/local/bin/XXXXX)"
+        i=1
+        for f in "${CUSTOM_CONF[@]}"; do
+            cp -a "$f" "$cdir/$(printf '%02d' $i)-$(basename "$f")"; ((i++))
+        done
+
+        echo -n "Starting chroot..."
+        # slight delay allows you to press Ctrl-C to abort the install and continue with arch-chroot /mnt
+        sleep 3
+        echo
+        # args: <this script> and the <chroot path> to custom conf files ($1 in chroot) and YES if -y or --yes was given ($2 in chroot)
+        arch-chroot /mnt "/usr/local/bin/$(basename "$0")" "${cdir#/mnt}" "$YES"
+
+        # This installer has done its job. Delete it and its .conf(s) from the new system
+        rm -rd {/mnt/usr/local/bin/{"$(basename "$0")","$(basename "$_CONF")",pkgs,scripts},"$cdir"}
+        
+        # poweroff or reboot? How to choose, or always poweroff, or...
+        p="reboot"
+        systemd-detect-virt -q && p="poweroff"
+        # single digit (i.e. max 9) seconds countdown
+        i=9; echo -n "umount and $p in $i seconds"
+        while ((i)); do sleep 1; echo -en "\b\b\b\b\b\b\b\b\b$((--i)) seconds"; done
+        echo -e "\n\nNow $p ..."
+        # last chance to press Ctrl-C and examine or fix the install before reboot/poweroff
+        sleep 2
+        grep -q /mnt/swap/swapfile /proc/swaps && swapoff /mnt/swap/swapfile
+        umount -R /mnt
+        [[ $p == "reboot" ]] && reboot || poweroff
+    fi
+}
+
+main "$@"

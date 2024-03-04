@@ -1,0 +1,33 @@
+# These packages will be installed only on real computers.
+# In a virtual machine this list will be ignored.
+bluez
+bluez-utils
+cups
+cups-pdf
+exfatprogs
+fuse2
+fuse3
+smartmontools
+iotop
+cpupower
+turbostat
+powertop
+cmark
+oath-toolkit
+mpv
+audacious
+x265
+x264
+dav1d
+vulkan-icd-loader
+
+# remmina
+remmina
+freerdp
+libvncserver
+
+# for hplip
+hplip
+python-pyqt5
+python-notify2
+python-reportlab

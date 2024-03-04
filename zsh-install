@@ -1,0 +1,408 @@
+#!/bin/bash
+# Install zsh and oh-my-zsh framework and some plugins for the user.
+# Also sets some of my personal aliases in ~/.aliases, which is loaded by
+# both ~/.bashrc and ~/.zshrc
+#
+# This script attempts to be somewhat distro-agnostic (Arch, Debian/Ubuntu, Fedora),
+# and it has been tested on FreeBSD also.
+
+if [[ $(id -u) = 0 && $SUDO_USER ]]; then
+  echo "You are now installing for root."
+  echo "Are you sure you want to install for root, and NOT for $SUDO_USER?"
+  echo
+  read -r -p "Continue as root [y/N]: " key
+  [[ ${key^} == Y* ]] || exit 1
+fi
+
+PROFILED=/etc/profile.d/env-vars.conf
+if type pacman &> /dev/null; then
+  INST=(pacman -Sq --noconfirm --needed)
+  if type paru &> /dev/null; then
+    AUR=(paru -Sa --skipreview --needed)
+  elif type yay &> /dev/null; then
+    AUR=(yay -Sa --noconfirm --needed)
+  elif type aura &> /dev/null; then
+    AUR=(sudo aura -Acx --noconfirm --needed)
+  fi
+elif type apt &> /dev/null; then
+  INST=(apt install -yy)
+elif type dnf &> /dev/null; then
+  INST=(dnf install -y)
+elif uname | grep -qiF BSD && type pkg &> /dev/null; then
+  INST=(pkg install -y)
+  PROFILED=/etc/profile
+fi
+[[ $(id -un) == root ]] || INST=(sudo "${INST[@]}")
+ffm="ffmpeg"
+dejavu="ttf-dejavu"
+
+# Fedora
+if grep -qF Fedora /etc/os-release && type dnf &> /dev/null; then
+  echo "Fedora detected."
+  grep -q "^max_parallel_downloads=" /etc/dnf/dnf.conf || echo -e "max_parallel_downloads=10\nfastestmirror=True\ndeltarpm=False" | sudo tee -a /etc/dnf/dnf.conf >/dev/null
+  dnf repolist | grep -q rpmfusion-free || read -rp "Enable rpmfusion repos [Y/n]?" _yn
+  [[ ${_yn,} != n* ]] && sudo dnf -y install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-"$(rpm -E %fedora)".noarch.rpm https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-"$(rpm -E %fedora)".noarch.rpm &&\
+    sudo dnf -y --allowerasing groupupdate core &&\
+    sudo dnf -y --allowerasing groupupdate multimedia &&\
+    sudo dnf -y --allowerasing groupupdate sound-and-video ||\
+    ffm="ffmpeg-free"
+  sudo dnf install -y zsh util-linux-user dnf5
+  dejavu="dejavu-fonts-all"
+fi
+
+# Install required packages if not already installed
+pkglist=()
+type zsh &> /dev/null || pkglist+=(zsh)
+type curl &> /dev/null || pkglist+=(curl)
+type git &> /dev/null || pkglist+=(git)
+type bat &> /dev/null || type batcat &> /dev/null || pkglist+=(bat) # bat is used as manpager
+type ffmpeg &> /dev/null || pkglist+=("$ffm") # needed in some aliases
+(( ${#pkglist[*]} > 0 )) && echo "Installing ${pkglist[*]}" && "${INST[@]}" "${pkglist[@]}"
+
+# helper function to handle sed -i correctly on both Linux and FreeBSD
+sedi() {
+  if uname | grep -qiF BSD; then
+    sed -i '' "$@"
+  else
+    sed -i "$@"
+  fi
+}
+
+function oh-my-zsh() {
+# Install oh-my-zsh
+  if [[ ! -d $HOME/.oh-my-zsh ]]; then
+    [[ $HOME == "/root" ]] && echo "Installing oh-my-zsh and plugins for root"
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+  else
+    echo "Oh-my-zsh is already installed."
+  fi
+  ZSHRC="$HOME/.zshrc"
+  # Install plugin zsh-autosuggestions
+  if [[ ! -d "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions" ]]; then
+    git clone https://github.com/zsh-users/zsh-autosuggestions.git "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
+    sedi -E 's/^(plugins=\(.*)\)/\1 zsh-autosuggestions)/' ~/.zshrc
+  else
+    echo "Updating zsh-autosuggestions"
+    git -C "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions" pull --ff-only
+  fi
+  # Install plugin zsh-syntax-highlighting (must be last in plugins)
+  if [[ ! -d "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting" ]]; then
+    git clone https://github.com/zsh-users/zsh-syntax-highlighting.git "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"
+    sedi -E 's/^(plugins=\(.*)\)/\1 zsh-syntax-highlighting)/' ~/.zshrc
+  else
+    echo "Updating zsh-syntax-highlighting"
+    git -C "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting" pull --ff-only
+  fi
+}
+
+function zsh-own-config() {
+# Install zsh with local self-hosted config
+  [[ -e "$PROFILED" ]] || sudo touch "$PROFILED"
+  [[ "$ZDOTDIR" ]] || { export ZDOTDIR="${XDG_CONFIG_HOME:-$HOME/.config}/zsh" && echo -e "export ZDOTDIR=\"\${XDG_CONFIG_HOME:-\$HOME/.config}/zsh\"" | sudo tee -a "$PROFILED" >/dev/null; }
+  [[ -d "$ZDOTDIR" ]] || mkdir "$ZDOTDIR"
+  ZSHRC="$ZDOTDIR/.zshrc"
+  [[ -e "$ZSHRC" ]] || echo \
+'#!'"/bin/bash
+
+# some useful options (man zshoptions)
+setopt autocd nomatch menucomplete
+setopt interactive_comments
+stty stop undef  # Disable ctrl-s to freeze terminal
+zle_highlight=('paste:none')
+
+unsetopt BEEP
+
+# completions
+autoload -Uz compinit
+zstyle ':completion:*' menu select
+# zstyle ':completion::complete:lsof:*' menu yes select
+zmodload zsh/complist
+# compinit
+_comp_options+=(globdots)   # Include hidden files
+
+autoload -U up-line-or-beginning-search
+autoload -U down-line-or-beginning-search
+zle -N up-line-or-beginning-search
+zle -N down-line-or-beginning-search
+
+# colors
+autoload -Uz colors && colors
+
+# Useful functions
+source \"\$ZDOTDIR/zsh-functions\"
+
+# Normal files to source
+zsh_add_file \"zsh-exports\"
+bindkey -e  # emacs mode
+#zsh_add_file \"zsh-vim-mode\"
+zsh_add_file \"zsh-aliases\"
+zsh_add_file \"zsh-prompt\"
+
+
+# Plugins
+zsh_add_plugin \"zsh-users/zsh-autosuggestions\"
+zsh_add_plugin \"zsh-users/zsh-syntax-highlighting\"
+
+# Key-bindings
+bindkey -s '^o' 'vifm^M'
+bindkey -s '^v' 'nvim \$(fzf)^M'
+bindkey '^[[P' delete-char
+bindkey \"^p\" up-line-or-beginning-search # Up
+bindkey \"^n\" down-line-or-beginning-search # Down
+" > "$ZSHRC"
+
+[[ -e "$ZDOTDIR/zsh-functions" ]] || echo \
+"# Function to source files if they exist
+function zsh_add_file() {
+    [ -f \"\$ZDOTDIR/\$1\" ] && source \"\$ZDOTDIR/\$1\"
+}
+
+function zsh_add_plugin() {
+    PLUGIN_NAME=\$(cut -d'/' -f2 <<< \"\$1\")
+    if [ -d \"\$ZDOTDIR/plugins/\$PLUGIN_NAME\" ]; then
+        # plugins
+        zsh_add_file \"plugins/\$PLUGIN_NAME/\$PLUGIN_NAME.plugin.zsh\" || \\
+        zsh_add_file \"plugins/\$PLUGIN_NAME/\$PLUGIN_NAME.zsh\"
+    else
+        git clone \"https://github.com/\$1.git\" \"\$ZDOTDIR/plugins/\$PLUGIN_NAME\"
+    fi
+}
+
+function zsh_add_completion() {
+    PLUGIN_NAME=\$(cut -d'/' -f2 <<< \"\$1\")
+    if [ -d \"\$ZDOTDIR/plugins/\$PLUGIN_NAME\" ]; then
+        # completions
+        completion_file_path=\$(/usr/bin/ls \$ZDOTDIR/plugins/\$PLUGIN_NAME/_\*)
+        fpath+=\"\$(dirname \"\${completion_file_path}\")\"
+        zsh_add_file \"plugins/\$PLUGIN_NAME/\$PLUGIN_NAME.plugin.zsh\"
+    else
+        git clone \"https://github.com/\$1.git\" \"\$ZDOTDIR/plugins/\$PLUGIN_NAME\"
+        fpath+=\$(/usr/bin/ls \$ZDOTDIR/plugins/\$PLUGIN_NAME/_\*)
+        rm \$ZDOTDIR/.zccompdump
+    fi
+    completion_file=\"\$(basename \"\${completion_file_path}\")\"
+    if [ \"\$2\" = true ] && compinit \"\${completion_file:1}\"
+}
+" > "$ZDOTDIR/zsh-functions"
+
+[[ -e "$ZDOTDIR/zsh-exports" ]] || echo \
+"HISTFILE=\"\$XDG_DATA_HOME\"/zsh/history
+HISTSIZE=100000
+SAVEHIST=100000
+" > "$ZDOTDIR/zsh-exports"
+[[ -d "${XDG_DATA_HOME:-$HOME/.local/share}/zsh" ]] || mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/zsh"
+
+[[ -e "$ZDOTDIR/zsh-prompt" ]] || echo \
+"eval \"\$(starship init zsh)\"" > "$ZDOTDIR/zsh-prompt"
+
+# shellcheck disable=SC2028
+[[ -e "$ZDOTDIR/zsh-vim-mode" ]] || echo \
+"# bindkey -e will be emacs mode, -v is vi mode
+bindkey -v
+export KEYTIMEOUT=1
+
+# Use vim keys in tab complete menu:
+bindkey -M menuselect '^h' vi-backward-char
+bindkey -M menuselect '^k' vi-up-line-or-history
+bindkey -M menuselect '^l' vi-forward-char
+bindkey -M menuselect '^j' vi-down-line-or-history
+bindkey -v '^?' backward-delete-char
+
+# Change cursor shape for different vi modes
+function zle-keymap-select() {
+    case \$KEYMAP in
+        vicmd) echo -ne '\e[1 q';; # block
+        viins|main) echo -ne '\e[5 q';; # beam
+    esac
+}
+zle -N zle-keymap-select
+zle-line-init() {
+    zle -K viins # initialize vi insert as keymap
+    echo -ne \"\e[5 q\"
+}
+zle -N zle-line-init
+echo -ne '\e[5 q' # Use beam shape cursor on startup.
+preexec() { echo -ne '\e[5 q' ;} # Use beam shape cursor for each new prompt.
+" > "$ZDOTDIR/zsh-vim-mode"
+
+[[ -e $ZDOTDIR/zsh-aliases ]] || echo \
+"alias zsh-update-plugins=\"find \$ZDOTDIR/plugins -type -d -exec test -e '{}/.git' ';' -print0 | xargs -I {} -0 git -C {} pull --ff-only\"
+" > "$ZDOTDIR/zsh-aliases"
+}
+
+# default to oh-my-zsh
+if [[ ${1,,} == omz ]] || [[ -e "$HOME/.oh-my-zsh/oh-my-zsh.sh" && ${1,,} != own ]] || [[ -z "$1" ]]; then
+  oh-my-zsh
+else
+  zsh-own-config
+fi
+
+if grep -q '^ZSH_THEME="powerlevel10k' "$ZSHRC"; then
+    REPLY=1
+elif grep -qE '^eval "\$\(starship init zsh\)' "$ZSHRC" || grep -qE '^eval "\$\(starship init zsh\)' "$(dirname "$ZSHRC")/zsh-prompt"; then
+    REPLY=2
+else
+    echo -e "\nSelect your zsh prompt theme"
+    select k in Powerlevel10k "Starship (default)"; do break; done
+    [[ $k != "Powerlevel"* ]] && REPLY=2
+fi
+case $REPLY in
+  1)
+    # powerlevel10k
+    if [[ ! -d "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k" ]]; then
+      git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k"
+      sedi -E 's|^(ZSH_THEME)=".*"|\1="powerlevel10k/powerlevel10k"|' ~/.zshrc
+    else
+      echo "Updating powerlevel10k"
+      git -C "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k" pull --ff-only
+    fi
+    ;;
+  2)
+    # Starship
+    if grep -Eqw "(apt|dnf)" <<<"${INST[*]}"; then
+        pushd /tmp || exit 1
+        curl -s https://api.github.com/repos/starship/starship/releases/latest |\
+          grep browser_download_url | grep x86_64-unknown-linux-gnu |\
+          cut -d '"' -f 4 | wget -qi - && tar -xf starship-*.tar.gz
+        [[ -f starship ]] && sudo mv -f starship /usr/local/bin/
+        popd || exit 1
+    else
+        command -v starship || "${INST[@]}" starship
+    fi
+    if [[ -e "$(dirname "$ZSHRC")/zsh-prompt" ]]; then
+      grep -qE '^eval "\$\(starship init zsh\)' "$(dirname "$ZSHRC")/zsh-prompt" || echo -e "\n# Starship prompt\neval \"\$(starship init zsh)\"" >> "$(dirname "$ZSHRC")/zsh-prompt"
+    else
+      sedi -E 's/^(ZSH_THEME=.*)/#\1/' "$ZSHRC"
+      grep -qE '^eval "\$\(starship init zsh\)' "$ZSHRC" || echo -e "\n# Starship prompt\neval \"\$(starship init zsh)\"" >> "$ZSHRC"
+    fi
+    # I use starship in bash too
+    grep -qiF Linux /etc/os-release && [[ $USER == *affa* ]] && ip -br a | grep -q 'UP.*1[02]{2}\.1[3-9][0-9]/' && { grep -qE '^eval "\$\(starship init bash\)' ~/.bashrc || echo -e "\n# Starship prompt\neval \"\$(starship init bash)\"" >> ~/.bashrc; }
+    [[ -s ~/.config/starship.toml ]] || echo -e "right_format = \"\"\"\$time\"\"\"\nadd_newline = false\n\n[time]\ndisabled = false\nformat = \"[\$time](\$style)\"\nstyle = \"fg:#668888\"" >> ~/.config/starship.toml
+    fc-list | grep -qi starship || { [[ ${AUR[*]} ]] && echo "You may want to install nerd-fonts-complete-starship from the AUR."; }
+    ;;
+  *)
+    echo "You may want to install some prompt theme for zsh."
+    ;;
+esac
+# Some fonts for the prompt themes
+! fc-list | grep -qiF DejaVu && echo "Installing $dejavu" && "${INST[*]}" "$dejavu"
+[[ $AUR ]] && ! fc-list | grep -qiF MesloLGS && "${AUR[@]}" ttf-meslo-nerd-font-powerlevel10k
+grep -qw apt <<<"${INST[*]}" && ! fc-list | grep -qiF powerline && echo "Installing fonts-powerline" && "${INST[@]}" fonts-powerline
+grep -qwE '(dnf|pkg)' <<<"${INST[*]}" && ! fc-list | grep -qiF powerline && echo "Installing powerline-fonts" && "${INST[@]}" powerline-fonts
+
+# Some personal settings,
+# Aliases are in ~/.aliases which is sourced in both ~/.bashrc and ~/.zshrc
+if [[ ! -f ~/.aliases ]]; then
+  command -v eza &> /dev/null && echo -e "alias ls=\"eza --group-directories-first\"\nalias la=\"ls -la\"" >> ~/.aliases ||\
+    echo -e "alias ls=\"ls -hN --color=auto --group-directories-first\"\nalias la=\"ls -lA\"" >> ~/.aliases
+  echo \
+"alias l.='ls -d .*'
+alias cd..='cd ..'
+alias xd='ls /usr/share/xsessions'
+alias dotfiles=\"/usr/bin/git --git-dir=\$HOME/.dotfiles --work-tree=\$HOME\"
+alias icat='kitty +kitten icat'" >> ~/.aliases
+
+  if command -v yt-dlp &> /dev/null; then
+    echo "alias yta-mp3='yt-dlp --extract-audio --audio-format mp3'" >> ~/.aliases
+    echo "alias yta-flac='yt-dlp --extract-audio --audio-format flac'" >> ~/.aliases
+  elif command -v youtube-dl &> /dev/null; then
+    echo "alias yta-mp3='youtube-dl --extract-audio --audio-format mp3'" >> ~/.aliases
+    echo "alias yta-flac='youtube-dl --extract-audio --audio-format flac'" >> ~/.aliases
+  fi
+  command -v nvim &> /dev/null && echo "alias vim='nvim'" >> ~/.aliases
+  [[ $EDITOR ]] && command -v sudoedit &>/dev/null && echo "alias svim='sudoedit'" >> ~/.aliases ||\
+    echo "alias svim='sudo vim'" >> ~/.aliases
+
+  grep -qF Fedora /etc/os-release && { grep -q '^alias dnf=' ~/.aliases || echo -e "alias dnf='dnf5'\nalias sudo='sudo '" >> ~/.aliases; }
+  # Arch Linux and derivatives
+  if command -v pacman &> /dev/null; then 
+    echo \
+"alias search='pacman -Ss'
+alias search-local='pacman -Qs'
+alias pkg-info='pacman -Qi'
+alias local-install='sudo pacman -U'
+alias uninstall='sudo pacman -R'
+alias autoremove='sudo pacman -Rns'
+alias unlock='sudo rm -f /var/lib/pacman/db.lck'" >> ~/.aliases
+    [[ -f /etc/arch-release ]] &&\
+      echo "alias update='sudo pacman -Syq --needed --noconfirm archlinux-keyring && sudo pacman -Su'" >> ~/.aliases ||\
+      echo "alias update='sudo pacman -Syu'" >> ~/.aliases
+  fi
+  command -v paru &> /dev/null && echo \
+"alias upall='paru'
+alias paruskip='paru -S --mflags --skipinteg'" >> ~/.aliases
+  command -v perl-rename &> /dev/null && echo "alias rename='perl-rename'" >> ~/.aliases
+  type apt &> /dev/null && echo "alias update='sudo apt update && sudo apt full-upgrade'" >> ~/.aliases
+  type dnf &> /dev/null && echo "alias update='sudo dnf update -y'" >> ~/.aliases
+  [[ ${OSTYPE,,} == freebsd* ]] && echo "alias update='sudo pkg upgrade -y'" >> ~/.aliases
+
+  # Next line is my totally personal alias, will likely not be applied in your network
+  { ip a || ifconfig; } | grep -q 'inet 192.168.100.[0-9]' && [[ $USER == *affa* ]] && echo "alias plexupdate=\"ssh root@192.168.100.150 'iocage exec plex /PMS_Updater.sh -vv -a'\"" >> ~/.aliases
+fi
+
+home_bin="$(grep -o "${HOME}[^:]*/bin" <<< "$PATH" | grep -vE "flatpak|snap")"
+# shellcheck disable=SC2174  # ok
+[[ $home_bin ]] || { mkdir -m700 -p "$HOME/.local/bin" && home_bin="$HOME/.local/bin"; }
+grep -qF '/.aliases' ~/.bashrc || echo -e "\n[ -e ~/.aliases ] && source ~/.aliases" >> ~/.bashrc
+bat="$(basename "$(command -v bat || command -v batcat)" 2>/dev/null)"
+[[ $bat == batcat ]] && [[ $home_bin ]] && { [[ -e "$home_bin/bat" ]] || ln -s "$(command -v "$bat")" "$home_bin/bat"; }
+[[ $bat ]] && { grep -q '^export MANPAGER=' ~/.bashrc || echo -e "\n# Set bat as manpager\nexport MANPAGER=\"sh -c 'col -bx | bat -l man -p'\"\n\n# Set nvim as manpager\n#export MANPAGER=\"nvim +Man!\"" >> ~/.bashrc; }
+if command -v neofetch &> /dev/null; then
+  grep -qxF 'neofetch' ~/.bashrc || echo -e "\n# Enable neofetch\nneofetch" >> ~/.bashrc
+elif command -v pfetch &> /dev/null; then
+  grep -qxF 'pfetch' ~/.bashrc || echo -e "\n# Enable pfetch\npfetch" >> ~/.bashrc
+fi
+grep -q '^GPG_TTY=' ~/.bashrc || echo -e "\nGPG_TTY=\$(tty)\nexport GPG_TTY" >> ~/.bashrc
+if command -v zoxide &> /dev/null; then
+  grep -qF 'zoxide' ~/.bashrc || echo -e "\n# Enable zoxide\neval \"\$(zoxide init --cmd cd bash)\"" >> ~/.bashrc
+fi
+
+if [[ -s ~/.zshrc ]]; then
+  [[ -d ${XDG_DATA_HOME:-$HOME/.local/share}/zsh ]] || mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/zsh"
+  grep -qF '/.aliases' ~/.zshrc || echo -e "\n[ -f ~/.aliases ] && source ~/.aliases" >> ~/.zshrc
+  grep -q '[^#].*HISTFILE=' ~/.zshrc || echo -e "\nHISTFILE=\"${XDG_DATA_HOME:-$HOME/.local/share}/zsh/history\"" >> ~/.zshrc
+  grep -qF 'HISTORY_IGNORE=' ~/.zshrc || echo -e "\nexport HISTORY_IGNORE='(ls|ll|cd|su|exit|pwd|cd ..|history)'" >> ~/.zshrc
+  [[ $bat ]] && { grep -q '^export MANPAGER=' ~/.zshrc || echo -e "\n# Set bat as manpager\nexport MANPAGER=\"sh -c 'col -bx | bat -l man -p'\"\nexport MANROFFOPT=\"-c\"\n\n# Set nvim as manpager\n#export MANPAGER=\"nvim +Man!\"" >> ~/.zshrc; }
+  if command -v neofetch &> /dev/null; then
+    grep -qxF 'neofetch' ~/.zshrc || echo -e "\n# Enable neofetch\nneofetch" >> ~/.zshrc
+  elif command -v pfetch &> /dev/null; then
+    grep -qxF 'pfetch' ~/.zshrc || echo -e "\n# Enable pfetch\npfetch" >> ~/.zshrc
+  fi
+  grep -Eq '^#?eval \$\(keychain ' ~/.bashrc && ! grep -Eq '^#?eval \$\(keychain ' ~/.zshrc &&\
+    echo -e "\n# Uncomment next line to start keychain to cache SSH keyphrases\n$(grep -E '^#?eval \$\(keychain .*' ~/.bashrc)" >> ~/.zshrc
+  grep -q '^GPG_TTY=' "$HOME"/.zshrc || grep -A1 -B1 '^GPG_TTY=' "$HOME"/.bashrc >> "$HOME"/.zshrc
+  if command -v zoxide &> /dev/null; then
+    grep -qF 'zoxide' ~/.zshrc || echo -e "\n# Enable zoxide\neval \"\$(zoxide init --cmd cd zsh)\"" >> ~/.zshrc
+  fi
+fi
+
+if [[ $ZSHRC == "$ZDOTDIR/.zshrc" ]]; then
+  grep -qF '/.aliases' "$ZDOTDIR/zsh-aliases" || echo -e "\n[ -f ~/.aliases ] && source ~/.aliases" >> "$ZDOTDIR/zsh-aliases"
+  grep -qF 'HISTORY_IGNORE=' "$ZDOTDIR/zsh-exports" || echo -e "\nexport HISTORY_IGNORE='(ls|ll|cd|su|exit|pwd|cd ..|history)'" >> "$ZDOTDIR/zsh-exports"
+  [[ $bat ]] && { grep -q '^export MANPAGER=' "$ZDOTDIR/zsh-exports" || echo -e "\n# Set $bat as manpager\nexport MANPAGER=\"sh -c 'col -bx | $bat -l man -p'\"\nexport MANROFFOPT=\"-c\"\n\n# Set nvim as manpager\n#export MANPAGER=\"nvim +Man!\"" >> "$ZDOTDIR/zsh-exports"; }
+  if command -v neofetch &> /dev/null; then
+    grep -qxF 'neofetch' "$ZSHRC" || echo -e "\n# Enable neofetch\nneofetch" >> "$ZSHRC"
+  elif command -v pfetch &> /dev/null; then
+    grep -qxF 'pfetch' "$ZSHRC" || echo -e "\n# Enable pfetch\npfetch" >> "$ZSHRC"
+  fi
+  grep -Eq '^#?eval \$\(keychain ' ~/.bashrc && ! grep -Eq '^#?eval \$\(keychain ' "$ZSHRC" &&\
+    echo -e "\n# Uncomment next line to start keychain to cache SSH keyphrases\n$(grep -E '^#?eval \$\(keychain .*' ~/.bashrc)" >> "$ZSHRC"
+  grep -q '^GPG_TTY=' "$ZSHRC" || grep -A1 -B1 '^GPG_TTY=' "$HOME"/.bashrc >> "$ZSHRC"
+  if command -v zoxide &> /dev/null; then
+    grep -qF 'zoxide' "$ZSHRC" || echo -e "\n# Enable zoxide\neval \"\$(zoxide init --cmd cd zsh)\"" >> "$ZSHRC"
+  fi
+fi
+
+if ! grep -q "^$USER:.*/zsh\$" /etc/passwd; then
+  echo
+  [[ $LANG == fi_* ]] && msg="Otetaanko käyttöön zsh kuori (K/e)? " || msg="Set zsh as your default shell [Y/n]? "
+  read -rp "$msg"
+  grep -q '^[EeNn]' <<< "$REPLY" && exit 0
+  if command -v homectl &> /dev/null && systemctl is-active -q systemd-homed && homectl list | grep -qw "^$USER"; then
+    sudo homectl update "$USER" --shell="$(command -v zsh)"
+    echo -e "\n* Please, reboot or logout/login to finalise your shell settings."
+  else
+    chsh -s "$(command -v zsh)"
+    echo -e "\n* Please, restart your shell session to finalise your shell settings."
+  fi
+fi

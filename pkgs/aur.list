@@ -1,0 +1,9 @@
+# These packages will be installed always and from the AUR
+# Do NOT add any kernels from the AUR into this list.
+# Some AUR packages will not install correctly, so be careful with your choices.
+#aura-bin # aura has been failing to build packages correctly lately
+paru-bin
+yay-bin
+downgrade
+pfetch
+ttf-ms-fonts # These font downloads are sometimes slow, but these are essential for the web

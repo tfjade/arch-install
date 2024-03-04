@@ -1,0 +1,2576 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2015,SC2016
+[[ $(hostnamectl --static) == archiso ]] && { echo -e "This script cannot run on the Arch Linux install media.\nRun arch-install instead to install Arch Linux."; exit 2; }
+[[ -f /etc/arch-release ]] || { echo "This script is for Arch Linux only."; exit 3; }
+if [ "$(id -u)" = 0 ]; then
+   echo "Run this script when logged in as a non-root user and without sudo."
+   exit 4
+fi
+
+# screen resolution for Virtual Machines
+VIRT_RESOLUTION="1920x1080"
+
+# text color codes
+NC="\e[0m"    # no color
+W="\e[1;37m"  # white
+C="\e[1;36m"  # cyan
+G="\e[1;32m"  # green
+R="\e[1;31m"  # red
+
+KEYMAP="$(grep -F KEYMAP= /etc/vconsole.conf | cut -d= -f2)"
+KEYMAP="${KEYMAP:-us}"
+USR="$(logname)"
+EFI="$(lsblk -no partuuid,mountpoint | grep -i 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'| cut -d' ' -f2)"
+[[ -d "${XDG_CACHE_HOME:-/home/$USR/.cache}" ]] || mkdir -p "${XDG_CACHE_HOME:-/home/$USR/.cache}"
+# If apparmor is enabled, unless already enabled, enable the apparmor-notify app for this user.
+# This is mainly for systemd-homed accounts.
+if systemctl -q is-enabled apparmor; then
+     APPARMOR=1
+     if [[ ! -s "/home/$USR/.config/autostart/apparmor-notify.desktop" ]]; then
+        [[ -d "/home/$USR/.config/autostart" ]] || mkdir -p "/home/$USR/.config/autostart"
+        echo \
+"[Desktop Entry]
+Type=Application
+Name=AppArmor Notify
+Comment=Receive on screen notifications of AppArmor denials
+TryExec=aa-notify
+Exec=aa-notify -p -s 1 -w 60 -f /var/log/audit/audit.log
+StartupNotify=false
+NoDisplay=true" > "/home/$USR/.config/autostart/apparmor-notify.desktop"
+     fi
+fi
+
+### Functions various tasks
+
+log_init() {
+  # Initialize logging
+  declare -a _log_queue
+  _log_index=0
+}
+
+log() {
+  # Add one or more strings to the log
+  local s
+  [[ $_log_index ]] || log_init
+  for s in "$@"; do _log_queue[_log_index++]="$s"; done
+}
+
+log_print() {
+  # Show all contents of the log
+  local s
+  for s in "${_log_queue[@]}"; do echo -e "\n* $s"; done
+}
+
+home_bin() {
+    local hb b
+    for hb in "$HOME"/.local/bin "$HOME"/bin "$HOME"/.bin; do
+        b="$(grep -o "${hb}[^:]*" <<< "$PATH")" && [[ -d "$b" ]] && break
+    done
+    [[ -d "$b" ]] && printf '%s' "$b"
+}
+
+# Install one or more AUR packages
+install_aur_pkg() {
+    local pkg opt status=0
+    opt=(--needed)
+    for pkg in "$@"; do
+        [[ $pkg == -q ]] && opt+=(--noconfirm) && continue
+        [[ $pkg == -* ]] && opt+=("$pkg") && continue
+        pacman -Q "$pkg" &> /dev/null && continue
+        echo "Installing $pkg"
+        if [[ -e /usr/bin/aura ]]; then
+            sudo aura -Acx "${opt[@]}" "$pkg" || status=$((++status))
+        elif [[ -e /usr/bin/paru ]]; then
+            [[ ${opt[*]} =~ --noconfirm ]] && ! [[ ${opt[*]} =~ --skipreview ]] && opt+=(--skipreview) 
+            paru -Sa "${opt[@]}" "$pkg" || status=$((++status))
+        elif [[ -e /usr/bin/yay ]]; then
+            yay -Sa "${opt[@]}" "$pkg" || status=$((++status))
+        elif [[ $(id -un) == root ]]; then
+            git "clone https://aur.archlinux.org/${pkg}.git" "/tmp/$pkg" && chmod o+w "/tmp/$pkg"
+            pushd "/tmp/$pkg" && [[ -s ./PKGBUILD ]] && su -m "$USR" -c "makepkg -sic ${opt[*]}" || status=$((++status)); popd || return 99
+        else
+            git "clone https://aur.archlinux.org/${pkg}.git" "/tmp/$pkg"
+            pushd "/tmp/$pkg" && [[ -s ./PKGBUILD ]] && makepkg -sic "${opt[@]}" || status=$((++status)); popd || return 99
+        fi
+    done
+    return $status
+}
+
+install_aura() {
+    install_aur_pkg -q aura-bin
+}
+
+install_paru() {
+    install_aur_pkg -q paru-bin && sudo sed -i '/^#BottomUp/s/^#//' /etc/paru.conf
+}
+
+install_yay() {
+    install_aur_pkg -q yay-bin
+}
+
+install_flatpak() {
+    if findmnt -n / | grep -qw btrfs; then
+        [[ -d /var/lib/flatpak ]] || sudo btrfs subvol create /var/lib/flatpak
+    fi
+    if findmnt -n /home | grep -qw btrfs; then
+        # user installed flatpaks live in ~/.var
+        # Don't snapshot them when you snapshot your home
+        [[ -d "$HOME/.var" ]] || btrfs subvol create "$HOME/.var"
+    fi
+    sudo pacman -Sq --noconfirm --needed flatpak && log "Flatpak with flathub integration installed."
+    sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+    install_aur_pkg -q flatseal
+}
+
+# Install_pamac
+# Every now and then pamac fails to build. This function attempts different versions
+# until a working version is found, or logs a message about failure to build any version of pamac.
+install_pamac() {
+    local p
+    command -v pamac &> /dev/null && return 0
+    [[ $1 == all ]] && local p=pamac-all || local p=pamac-aur
+    if [[ $p == pamac-all ]]; then
+        install_flatpak
+        install_aur_pkg -q snapd && log "Snapd installed."
+        if install_aur_pkg -q "$p"; then
+            log "${p^} installed."
+        elif install_aur_pkg -q pamac-all-git; then
+            p=pamac-all-git
+            log "Pamac-all failed, ${C}$p${NC} installed instead.\nYou may try to install pamac-all later."
+        elif install_aur_pkg -q pamac-aur; then
+            p=pamac-aur
+            log "Pamac-all failed, ${C}$p${NC} installed instead.\nYou may try to install pamac-all later."
+        elif install_aur_pkg -q pamac-aur-git; then
+            p=pamac-aur-git
+            log "Pamac-all failed, ${C}$p${NC} installed instead.\nYou may try to install pamac-all later."
+        else
+            log "\e[1;41m Failed \e[0m installing any version of pamac. Please, try again later."
+        fi
+    elif install_aur_pkg -q "$p"; then
+        log "${p^} installed."
+    elif install_aur_pkg -q "${p}-git"; then
+        p=pamac-aur-git
+        log "${p^} installed.\nYou may try to install ${p%-git} later."
+    else
+        log "\e[1;41m Failed \e[0m installing $p. Please, try again later."
+    fi
+    if command -v pamac &> /dev/null; then
+        [[ $desktop == plasma ]] && [[ $p == pamac-aur* ]] && install_aur_pkg -q pamac-tray-icon-plasma
+        return 0
+    else
+        return 1
+    fi
+}
+
+# install_x11vnc [username]
+# where [username] is optional.
+install_x11vnc() {
+
+    local password random_pw f m
+    sudo pacman -S --noconfirm --needed x11vnc
+    if [[ ! -s /etc/systemd/system/vnc.service ]]; then
+        echo \
+"[Unit]
+Description=VNC Server
+After=multi-user.target network.target
+
+[Service]
+Restart=always
+ExecStart=/usr/bin/x11vnc -auth guess -forever -loop -display :0 -noxdamage -repeat -rfbport 5900 -shared -rfbauth /etc/vnc.passwd
+
+[Install]
+WantedBy=multi-user.target" | sudo tee /etc/systemd/system/vnc.service > /dev/null
+        if [ -d "/home/${1:-$USR}" ] && [ ! -e /etc/vnc.passwd ]; then
+            echo
+            read -erp "Enter a VNC password (empty will create randomized password): " password
+            [[ $password ]] || { echo -e "\nCreating randomized VNC password.\nUser ${1:-$USR} can find the password in his/her home directory.\n"; random_pw="$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)"; }
+            sudo x11vnc -storepasswd "${password:-$random_pw}" /etc/vnc.passwd
+            f="VNC password Delete after looking.txt"
+            m="VNC password: $random_pw\n\n# The password hash is in /etc/vnc.passwd\n#\n# Change the VNC password with\n#\n#   sudo x11vnc -storepasswd [PASSWORD] /etc/vnc.passwd\n"
+            [[ $random_pw ]] && { echo -e "$m" | sudo tee "/home/${1:-$USR}/$f" >/dev/null; sudo chown "${1:-$USR}": "/home/${1:-$USR}/$f"; }
+        fi
+        which ufw && sudo ufw allow VNC
+        sudo systemctl enable --now vnc.service
+        log "VNC server x11vnc installed and started."
+    fi
+}
+
+install_tigervnc() {
+    sudo pacman -Sq --needed --noconfirm tigervnc
+    # disable and stop x11vnc, if it is installed
+    systemctl -q is-enabled vnc.service && sudo systemctl disable --now vnc.service
+    sudo test -d /root/.vnc || sudo mkdir /root/.vnc
+    [[ -d ~/.vnc ]] || mkdir ~/.vnc
+    touch ~/.vnc/config
+    echo -e "\nsession=${XDG_SESSION_DESKTOP:-$DESKTOP_SESSION}\ngeometry=1920x1080\nsecuritytypes=vncauth,tlsvnc\nalwaysshared" | sudo tee -a /etc/tigervnc/vncserver-config-defaults >/dev/null
+    echo -e "\n:1=$USR" | sudo tee -a /etc/tigervnc/vncserver.users >/dev/null
+    echo \
+"Section \"Module\"
+Load \"vnc\"
+EndSection
+
+Section \"Screen\"
+Identifier \"Screen0\"
+Option \"UserPasswdVerifier\" \"VncAuth\"
+Option \"PasswordFile\" \"/root/.vnc/passwd\"
+EndSection" | sudo tee /etc/X11/xorg.conf.d/10-vnc.conf >/dev/null
+    if sudo test -e /etc/vnc.passwd; then
+        sudo cp /etc/vnc.passwd /root/.vnc/passwd
+        sudo cp /etc/vnc.passwd ~/.vnc/passwd
+        sudo chown "$USR": ~/.vnc/passwd
+    else
+        echo -e "\nEnter new VNC password for yourself"
+        vncpasswd
+    fi
+    which ufw && sudo ufw allow 5901/tcp
+    sudo systemctl enable --now vncserver@:1.service
+    log "VNC server TigerVNC installed and started at port 5901"
+}
+
+install_kitty() {
+    local font conf f
+    pacman -Q kitty &>/dev/null && return
+    sudo pacman -Sq --noconfirm --needed kitty
+    if pacman -Q kitty &>/dev/null; then
+        conf="${XDG_CONFIG_HOME:-/home/$USR/.config}/kitty/kitty.conf"
+        fc-list | grep -qiF meslolgs && font="MesloLGS NF" || \
+        fc-list | grep -qi 'droidsansm nerd font mono' && font="DroidSansM Nerd Font Mono" || \
+        fc-list | grep -qiF jetbrains && font="JetBrains Mono NL" || \
+        font="DejaVu Sans Mono"
+        [[ -d "$(dirname "$conf")" ]] || mkdir -p "$(dirname "$conf")"
+        cp -n /usr/share/doc/kitty/kitty.conf "$conf"
+        sed -Ei 's/^#?(\s*enable_audio_bell)\s+.*/\1 no/' "$conf"
+        sed -Ei 's/^#?(\s*background_opacity)\s+.*/\1 0.85/' "$conf"
+        #sed -Ei 's/^#?(\s*dynamic_background_opacity)\s+.*/\1 yes/' "$conf"
+        sed -Ei 's/^#?(\s*update_check_interval)\s+.*/\1 0/' "$conf"
+        sed -Ei 's/^#?(\s*shell_integration)\s+.*/\1 enabled no-sudo/' "$conf"
+        sed -Ei 's/^#?(\s*window_padding_width)\s+.*/\1 6/' "$conf"
+        sed -Ei "s/^#?(\s*font_family\s+).*/\1 $font/" "$conf"
+        sed -Ei 's/^#?(\s*font_size)\s+.*/\1 12.0/' "$conf"
+        [ -s "/home/$USR/.zshrc" ] && ! grep -qF 'kitty + complete setup zsh' "/home/$USR/.zshrc" && \
+          echo -e "\nautoload -Uz compinit\ncompinit\n# completion for kitty\nkitty + complete setup zsh | source /dev/stdin" >> "/home/$USR/.zshrc"
+        log "Kitty is installed. The settings are in ~/.config/kitty/kitty.conf"
+        # creating a fix for kitty appearance on wayland + gnome, disabled by default
+        # create a script 'kitty-fix' in user's bin folder
+        sed -i '/linux_display_server auto/a # linux_display_server x11' "$conf"
+        f="$(home_bin)"
+        [[ -d "$f" && ! -e "$f/kitty-fix" ]] &&
+        conf="${conf/\/home\/"$USR"/\$HOME}" &&
+        echo \
+'#!'"/usr/bin/env bash
+f=$conf
+[[ -e \"\$f\" ]] || exit
+[[ \$XDG_SESSION_TYPE == wayland && \$XDG_SESSION_DESKTOP == gnome ]] &&
+    sed -i '/linux_display_server x11/s/^#//' \"\$f\"
+[[ \$XDG_SESSION_TYPE != wayland || \$XDG_SESSION_DESKTOP != gnome ]] && 
+    sed -i '/^\s*linux_display_server x11/s/^/#/' \"\$f\"
+" > "$f/kitty-fix" && chmod +x "$f/kitty-fix"
+        if [[ -e "$f/kitty-fix" ]]; then
+            [[ -d "$HOME/.config/autostart" ]] || mkdir "$HOME/.config/autostart"
+            [[ -e "$HOME/.config/autostart/kitty-fix.desktop" ]] || echo \
+"[Desktop Entry]
+Type=Application
+Name=Kitty-fix
+Exec=$f/kitty-fix
+StartupNotify=false
+Terminal=false" > "$HOME/.config/autostart/kitty-fix.desktop"
+        fi
+    fi
+}
+
+# Fix Alacritty font scaling in vm's
+install_alacritty-fix() {
+    local d t;
+    #t=/etc/security/pam_env.conf
+    #if [[ -s "$t" ]]; then
+    #    grep -qG '^WINIT_X11_SCALE_FACTOR' "$t" || { echo -e "# Alacritty-fix\nWINIT_X11_SCALE_FACTOR DEFAULT=1" | sudo tee -a "$t" > /dev/null; success=1; }
+    #else
+    #    t=/etc/environment
+    #    grep -qG '^WINIT_X11_SCALE_FACTOR=' "$t" || { echo -e "# Alacritty-fix\nWINIT_X11_SCALE_FACTOR=1" | sudo tee -a "$t" > /dev/null; success=1; }
+    #fi
+    d="${XDG_CONFIG_HOME:-/home/$USR/.config}/alacritty"
+    t="$d/env.toml"
+    if grep -qs '^\[env\]' "$t"; then
+        grep -q '^WINIT_X11_SCALE_FACTOR = "1"' "$t" || sed -i '/^\[env\]/a WINIT_X11_SCALE_FACTOR = "1"' "$t"
+    else
+        [[ -d "$d" ]] || mkdir -p "$d"
+        cat >> "$d/env.toml" << EOF
+[env]
+WINIT_X11_SCALE_FACTOR = "1"
+EOF
+        t="$d/alacritty.toml"
+        if [[ -s "$t" ]]; then
+            grep -q '^import =' "$t" || sed -i '1i import = [\n]\n' "$t"
+            grep -q '/\.config/alacritty/env\.toml' "$t" || sed -i '/^import =/a "~/.config/alacritty/env.toml",' "$t"
+            sed -i 's/^"~/    &/' "$t"
+        fi  
+    fi
+    log "Alacritty-fix is installed."
+    systemd-detect-virt -q && [[ $XDG_SESSION_TYPE == "wayland" ]] && log "If alacritty font is still too big, try resizing the terminal window."
+}
+
+install_alacritty() {
+    local d f font
+    sudo pacman -Sq --noconfirm --needed alacritty
+    d="${XDG_CONFIG_HOME:-/home/$USR/.config}/alacritty"
+    [[ -d "$d" ]] || mkdir -p "$d"
+    if [[ ! -f "$d/alacritty.toml" ]]; then
+        fc-list | grep -qiF meslolgs && font="MesloLGS NF" || \
+        fc-list | grep -qiF jetbrains && font="JetBrains Mono NL" || \
+        font="DejaVu Sans Mono"
+        #fc-list | grep -qiF saucecodepro && font="SauceCodePro Nerd Font Mono"
+        
+        cat > "$d/colors-kitty.toml" << EOF
+[colors.bright]
+black   = "0x767676"
+blue    = "0x1a8fff"
+cyan    = "0x14ffff"
+green   = "0x23fd00"
+magenta = "0xfd28ff"
+red     = "0xf2201f"
+white   = "0xffffff"
+yellow  = "0xfffd00"
+
+[colors.normal]
+black   = "0x000000"
+blue    = "0x0d73cc"
+cyan    = "0x0dcdcd"
+green   = "0x19cb00"
+magenta = "0xcb1ed1"
+red     = "0xcc0403"
+white   = "0xdddddd"
+yellow  = "0xcecb00"
+EOF
+
+        cat >> "$d/keybindings.toml" <<- EOF
+[keyboard]
+bindings = [
+    { action = "Copy",             key = "C",        mods = "Shift|Control" },
+    { action = "Paste",            key = "V",        mods = "Shift|Control" },
+    { action = "ScrollPageUp",     key = "PageUp",   mods = "Shift|Control" },
+    { action = "ScrollPageDown",   key = "PageDown", mods = "Shift|Control" },
+    { action = "ScrollLineUp",     key = "Up",       mods = "Shift|Control" },
+    { action = "ScrollLineDown",   key = "Down",     mods = "Shift|Control" },
+    { action = "ScrollToTop",      key = "Home",     mods = "Shift|Control" },
+    { action = "ScrollToBottom",   key = "End",      mods = "Shift|Control" },
+    { action = "SpawnNewInstance", key = "Return",   mods = "Shift|Control" },
+]
+EOF
+        
+        cat >> "$d/alacritty.toml" << EOF
+import = [
+]
+
+[font]
+size = 12.0
+normal = { family = "$font", style = "Regular" }
+
+[cursor]
+style = { shape = "Beam", blinking = "Always" }
+
+[colors]
+primary = { foreground = "0xdddddd", background = "0x000000" }
+
+[scrolling]
+history = 100000
+multiplier = 3
+
+[window]
+opacity = 0.85
+blur = true
+dimensions = { columns = 136, lines = 38 }
+padding = { x = 6, y = 6 }
+EOF
+        for f in "$d"/*.toml; do
+            [[ $f == *"/alacritty.toml" ]] || sed -i "/^import =/a \"${f/\/home\/$USR/\~}\"," "$d/alacritty.toml"
+        done
+        sed -i 's/^"~/    &/' "$d/alacritty.toml"
+        
+        #systemctl-detect-virt -q && install_alacritty-fix
+        log "Alacritty is installed."
+    fi
+}
+
+# gen_ssh
+#   $1: user
+# Create Ed25519 SSH key for user $1, only if directory /home/$1/.ssh does not exist.
+gen_ssh() {
+    local msg ssh_pw ssh_pw_again
+    sudo pacman -Sq --noconfirm --needed openssh
+    systemctl -q is-enabled sshd || systemctl -q enable --now sshd
+    if [ -n "$1" ] && [ -d "/home/$1" ] && [ ! -d "/home/$1/.ssh" ]; then
+        mkdir -m700 "/home/$1/.ssh"
+        while true; do
+            msg="Enter SSH key passphrase for user $1 (empty for no passphrase):"
+            read -r -s -p "$msg" ssh_pw; echo
+            read -r -s -p "Enter same passphrase again:" ssh_pw_again; echo
+            [[ "$ssh_pw" == "$ssh_pw_again" ]] && break
+            echo -e "\nError: Passphrases did not match.\n"
+        done
+        ssh-keygen -t ed25519 -f "/home/$1/.ssh/id_ed25519" -q -C "$1@$(hostnamectl --static)" -N "$ssh_pw"
+        if [[ $ssh_pw ]]; then
+            sudo pacman -Sq --noconfirm --needed keychain
+            echo -e "\n# Start keychain\n#eval \$(keychain --eval --quiet id_ed25519)" >> "/home/$1/.bashrc"
+            [[ -e "/home/$1/.zshrc" ]] && echo -e "\n# Start keychain\n#eval \$(keychain --eval --quiet id_ed25519)" >> "/home/$1/.zshrc"
+        fi
+        sudo chown -R "$1": "/home/$1/.ssh"
+        log "New SSH key created for user $1. The public key is in ~/.ssh/id_ed25519.pub"
+    fi
+}
+
+enable_multilib() {
+    # Remove the comment marker # from the #[multilib] group in /etc/pacman.conf
+    sudo sed -i '/^#\[multilib\]/,/^$/s/^#//' /etc/pacman.conf
+    sudo pacman -Sy
+    [[ $1 != '-q' ]] && grep -qxF '[multilib]' /etc/pacman.conf && log "[multilib] is now enabled."
+}
+
+disable_multilib() {
+    # Add the comment marker # on the [multilib] group in /etc/pacman.conf
+    sed -Ei '/^\[multilib\]/,/^$/s/^([^$])/#\1/' /etc/pacman.conf
+    sudo pacman -Sy
+    grep -qxF '#[multilib]' /etc/pacman.conf && log "[multilib] is now disabled."
+}
+
+_install_chaotic() {
+    local p
+    grep -qxE '#?\[chaotic-aur\]' /etc/pacman.conf && return
+    echo "Installing [chaotic-aur] into /etc/pacman.conf"
+    for p in chaotic-keyring chaotic-mirrorlist; do
+        git clone "https://aur.archlinux.org/${p}.git" "/tmp/$p"
+        pushd "/tmp/$p" && [[ -s ./PKGBUILD ]] && makepkg -si --clean --noconfirm; popd || return
+    done
+    [ -s /etc/pacman.d/chaotic-mirrorlist ] && echo -e "\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist" | sudo tee -a /etc/pacman.conf
+    enable_multilib -q
+}
+
+enable_chaotic() {
+    local f
+    if ! grep -qxE '#?\[chaotic-aur\]' /etc/pacman.conf; then
+        _install_chaotic
+    else
+        # Remove the comment marker # from the #[chaotic-aur] group in /etc/pacman.conf
+        sudo sed -i '/^#\[chaotic-aur\]/,/^$/s/^#//' /etc/pacman.conf 
+        enable_multilib -q
+        f="/home/$USR/.local/bin/chaotic-keyring-fix"
+        [[ -d "$(dirname "$f")" ]] && [[ ! -s "$f" ]] && echo -e "#!/bin/bash\n# Fix chaotic keyring errors\nsudo pacman -S --noconfirm chaotic-keyring\necho \"If needed, run also: sudo pacman-key --populate chaotic\"" > "$f" && chmod +x "$f"
+    fi
+    grep -qxF '[chaotic-aur]' /etc/pacman.conf && log "[chaotic-aur] is now enabled."
+}
+
+disable_chaotic() {
+    # Add the comment marker # on the [chaotic-aur] group in /etc/pacman.conf
+    sudo sed -Ei '/^\[chaotic-aur\]/,/^$/s/^([^$])/#\1/' /etc/pacman.conf
+    sudo pacman -Sy
+    grep -qxF '#[chaotic-aur]' /etc/pacman.conf && log "[chaotic-aur] is now disabled."
+}
+
+disable_hibernation() {
+    if pacman -Q polkit &>/dev/null; then
+      local t=/etc/polkit-1/rules.d/10-disable-hibernation.rules
+      echo \
+"polkit.addRule(function(action, subject) {
+    if (action.id == \"org.freedesktop.login1.hibernate\" ||
+        action.id == \"org.freedesktop.login1.hibernate-multiple-sessions\")
+    {
+        return polkit.Result.NO;
+    }
+});" | sudo tee "$t" > /dev/null
+      sudo chmod o+rx "$(dirname "$t")"
+      log "Hibernation is disabled."
+    fi
+}
+
+enable_hibernation() {
+  local t=/etc/polkit-1/rules.d/10-disable-hibernation.rules
+  sudo test -s "$t" && sudo rm --interactive=never "$t" && log "Hibernation is no more disabled."
+}
+
+install_vim() {
+    pacman -Q neovim &>/dev/null || sudo pacman -Sq --noconfirm --needed vim neovim
+    [[ -d "/home/$USR/.vim" ]] || mkdir "/home/$USR/.vim"
+    [[ -d "${XDG_CONFIG_HOME:-/home/$USR/.config}/nvim" ]] || mkdir -p "${XDG_CONFIG_HOME:-/home/$USR/.config}/nvim"
+    echo -e "set runtimepath^=~/.vim runtimepath+=~/.vim/after\nlet &packpath = &runtimepath\nsource ~/.vimrc" > "/home/$USR/.config/nvim/init.vim"
+    curl -fLo ~/.vim/autoload/plug.vim --create-dirs https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+    cat > "/home/$USR/.vimrc" <<- EOF
+" Remap CapsLock to swap with Esc on x11 and wayland/Gnome
+" Option caps:swapescape swaps CapsLock and Esc
+if \$XDG_SESSION_TYPE == 'x11'
+  autocmd VimEnter * :silent !setxkbmap -option caps:escape
+  autocmd VimLeave * :silent !setxkbmap -option
+endif
+if \$XDG_SESSION_TYPE == 'wayland' && (\$XDG_SESSION_DESKTOP == 'gnome' || \$XDG_CURRENT_DESKTOP == 'ubuntu:GNOME')
+  autocmd VimEnter * :silent !gsettings set org.gnome.desktop.input-sources xkb-options "['caps:escape']"
+  autocmd VimLeave * :silent !gsettings set org.gnome.desktop.input-sources xkb-options "[]"
+endif
+
+" Install vim-plug if not found
+if empty(glob('~/.vim/autoload/plug.vim'))
+  silent !curl -fLo ~/.vim/autoload/plug.vim --create-dirs https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+endif
+
+" Run PlugInstall if there are missing plugins
+autocmd VimEnter * if len(filter(values(g:plugs), '!isdirectory(v:val.dir)'))
+  \\| PlugInstall --sync | source \$MYVIMRC
+\\| endif
+
+" Install Plug plugins
+call plug#begin('~/.vim/plugged')
+
+" Install vim-airline
+Plug 'vim-airline/vim-airline'
+
+" Install codedark color scheme
+Plug 'tomasiser/vim-code-dark'
+
+" Install dracula color scheme
+Plug 'dracula/vim',{'as':'dracula'}
+
+" Install NerdTree
+Plug 'preservim/nerdtree'
+map <C-n> :NERDTreeToggle<CR>
+set path+=**
+
+" Install Tagbar
+"Plug 'preservim/tagbar'
+"map <F8> :TagbarToggle<CR>
+
+" Some tpope plugins
+Plug 'tpope/vim-sensible'
+Plug 'tpope/vim-commentary'
+Plug 'tpope/vim-surround'
+
+call plug#end()
+
+"set textwidth=80
+"set colorcolumn=+1
+set wildmenu
+set nowrap
+set showcmd
+let mapleader = ','
+set scrolloff=999
+
+syntax on
+set background=dark
+colorscheme codedark
+" If using colorscheme dracula, adjust highlight CursorLine ... colors also.
+"colorscheme dracula
+
+nnoremap <Space> @q
+
+" Remove trailing whitespace on save
+autocmd BufWritePre * %s/\\s\\+\$//e
+
+" Basic settings
+set mouse=a
+set ignorecase
+set number relativenumber
+set smartcase
+set hlsearch
+"set encoding=utf-8
+if has('termguicolors')
+  set termguicolors
+endif
+
+" Tab settings
+set expandtab
+set shiftwidth=4
+set softtabstop=4
+set tabstop=4
+
+set cursorline
+set cursorcolumn
+highlight CursorLine ctermbg=Yellow cterm=bold guibg=#2d2d2d
+highlight CursorColumn ctermbg=Yellow cterm=bold guibg=#2d2d2d
+
+" Autocompletion
+set wildmode=longest,list,full
+
+" Fix splitting
+set splitbelow splitright
+
+" Map w!! to 'save using sudo'
+cmap w!! w !sudo tee > /dev/null %
+EOF
+    log "Vim and Neovim are installed, and sharing the settings in ~/.vimrc"
+
+}
+
+install_helix() {
+    local conf
+    conf="$HOME/.config/helix/config.toml"
+    sudo pacman -Sq --noconfirm --needed helix
+    [[ -d "$(dirname "$conf")" ]] || mkdir "$(dirname "$conf")"
+    [[ -e "$conf" ]] || echo \
+"theme = \"dark_plus\"
+
+[editor]
+line-number = \"relative\"
+bufferline = \"multiple\"
+
+[editor.cursor-shape]
+insert = \"bar\"
+
+[keys.normal]
+esc = [\"collapse_selection\", \"keep_primary_selection\"]
+" > "$conf"
+    log "Helix is installed. Helix config is in $conf"
+}
+
+install_bootbackup() {
+    sudo pacman -Sq --noconfirm --needed rsync
+    [[ -d /etc/pacman.d/hooks ]] || sudo install -d /etc/pacman.d/hooks
+    local t=/etc/pacman.d/hooks/50-bootbackup.hook
+    [[ -s "$t" ]] || echo \
+"[Trigger]
+Operation = Install
+Operation = Remove
+Type = Path
+Target = boot/*
+
+[Action]
+Depends = rsync
+Description = Backing up /boot/...
+When = PreTransaction
+Exec = /usr/bin/rsync -a --delete /boot /.bootbackup" | sudo tee "$t" > /dev/null
+    [[ -s $t ]] && log "Bootbackup installed.\n  The hook is in: $t"
+}
+
+install_fonts() {
+  sudo pacman -Sq --noconfirm --needed ttf-font-awesome ttf-opensans ttf-ubuntu-font-family \
+    ttf-dejavu ttf-bitsream-vera adobe-source-code-pro-fonts
+}
+
+# Firefox localization may or may not work, depending on the format of the keymap. Works with "simple" keymaps.
+install_firefox() {
+  sudo pacman -Sq --noconfirm --needed firefox
+  [[ $KEYMAP == us ]] || sudo pacman -Sq --noconfirm --needed "firefox-i18n-${KEYMAP%%-*}"
+}
+
+# Thunderbird localization may or may not work, depending on the format of the KEYMAP. Works with "simple" keymaps.
+install_thunderbird() {
+  sudo pacman -Sq --noconfirm --needed thunderbird
+  [[ $KEYMAP == us ]] || sudo pacman -Sq --noconfirm --needed "thunderbird-i18n-${KEYMAP%%-*}"
+}
+
+install_brave() {
+  #select which version to install
+  [[ $1 == beta ]] && install_aur_pkg -q brave-beta-bin || install_aur_pkg -q brave-bin
+  # fix save file dialog in Brave, needed atm. (6/2022)
+  sudo pacman -Sq --noconfirm --needed xdg-desktop-portal-gtk
+  pacman -Q | grep -q xdg-desktop-portal-gnome && sudo pacman -R --noconfirm xdg-desktop-portal-gnome
+}
+
+# Libre Office localization may or may not work, depending on the format of the keymap.
+# Works with "simple" keymaps.
+install_libreoffice() {
+  sudo pacman -Sq --noconfirm --needed libreoffice-fresh
+  [[ $KEYMAP == us ]] || sudo pacman -Sq --noconfirm --needed "libreoffice-fresh-${KEYMAP%%-*}"
+}
+
+set_xkeymap() {
+  if [[ $KEYMAP != us ]]; then
+    if [[ -f /home/$USR/.xprofile ]]; then
+        grep -qG '^setxkbmap ' "/home/$USR/.xprofile" || echo -e "setxkbmap $KEYMAP" >> "/home/$USR/.xprofile"
+    else
+        sudo localectl set-x11-keymap "$KEYMAP"
+    fi
+  fi
+}
+
+# Samba with basic Samba settings
+install_samba() {
+    sudo pacman -Sq samba gvfs-smb --noconfirm --needed || return 1
+    grep -qwF sambashare /etc/group || sudo groupadd -r sambashare
+    if ! groups "$USR" | grep -wq sambashare; then
+        sudo gpasswd sambashare -a "$USR"
+        echo -e "\nEnter your password for \e[1;36mSMB shares\e[0m"
+        sudo smbpasswd -a "$USR"
+    fi
+    if ! [[ -s /etc/samba/shares.conf ]]; then
+        echo "# Examples: https://wiki.archlinux.org/title/Samba#Set_and_forcing_permissions" | sudo tee /etc/samba/shares.conf > /dev/null
+        [[ $APPARMOR ]] && echo "# See also: https://wiki.archlinux.org/title/Samba#Permission_issues_on_AppArmor" | sudo tee -a /etc/samba/shares.conf > /dev/null
+    fi
+    if ! [[ -s /etc/samba/smb.conf ]]; then
+        echo \
+"[global]
+workgroup = WORKGROUP
+
+# SMB3_00 for Windows 10/11 (SMB2 is the default)
+#server min protocol = SMB3_00
+#client ipc min protocol = SMB3_00
+#client min protocol = SMB3_00
+#server smb encrypt = desired
+#client smb encrypt = desired
+
+security = user
+map to guest = Bad Password
+guest account = nobody
+
+log file = /var/log/samba/%m.log
+max log size = 50
+
+# For usershares uncomment and edit the following lines
+#usershare path = /some/path
+#usershare max shares = 50
+#usershrare allow guests = yes
+#usershare owner only = yes
+
+# Disable printer sharing. To enable printer sharing,
+# remove (i.e. comment out) the following lines
+load printers = No
+printing = bsd
+printcap name = /dev/null
+disable spoolss = Yes
+
+# Add shares in this included file, or below
+include = /etc/samba/shares.conf" | sudo tee /etc/samba/smb.conf > /dev/null
+    fi
+
+    [[ -d /var/lib/samba/usershares ]] || sudo mkdir -p /var/lib/samba/usershares
+
+    # shares on a Mac, install mdns (needs avahi):
+    #sudo pacman -Sq --noconfirm --needed avahi nss-mdns
+    #sudo systemctl enable --now avahi-daemon.service
+    #sudo sed -Ei 's/(files mymachines) myhostname/\1/' /etc/nsswitch.conf
+    #sudo sed -Ei 's/(\[\!UNAVAIL=return\]) dns/\1 mdns dns wins myhostname/' /etc/nsswitch.conf
+
+    sudo systemctl enable --now -f smb avahi-daemon && log "Samba is now enabled and running."
+    if pacman -Q nemo &> /dev/null || [[ ${desktop,,} == cinnamon ]]; then
+      sudo pacman -Sq --noconfirm --needed nemo-share
+    fi
+    if pacman -Q nautilus &> /dev/null || [[ ${desktop,,} == gnome ]]; then
+      sudo pacman -Sq --noconfirm --needed nautilus-share
+    fi
+    if pacman -Q dolphin &> /dev/null || [[ ${desktop,,} == plasma ]]; then
+      sudo pacman -Sq --noconfirm --needed kdenetwork-filesharing
+    fi
+    if pacman -Q caja &> /dev/null || [[ ${desktop,,} == mate ]]; then
+      sudo pacman -Sq --noconfirm --needed caja-share
+    fi
+    if pacman -Q thunar &> /dev/null || [[ ${desktop,,} == xfce ]]; then
+      sudo pacman -Sq --noconfirm --needed thunar-shares-plugin
+    fi
+}
+
+install_steam() {
+     grep -qxF "#en_US.UTF-8 UTF-8" /etc/locale.gen && sudo sed -Ei 's/#(en_US.UTF-8 UTF-8)/\1/' /etc/locale.gen && locale-gen
+     enable_multilib
+     systemctl -q is-enabled NetworkManager || sudo pacman -S --noconfirm --needed lib32-systemd
+     fc-list | grep -qiF arial || install_aur_pkg -q ttf-ms-fonts
+     sudo pacman -Sq --noconfirm --needed steam
+     log "Steam is installed."
+}
+
+install_postgresql() {
+    local opt PGROOT conf version old_version cmd UPGRADE OLDPGBIN OLDPGDATA NEWPGBIN NEWPGDATA
+    conf=/etc/systemd/system/postgresql.service.d
+    [[ -s $conf/PGROOT.conf ]] && PGROOT="$(grep '^Environment=PGROOT=' "$conf/PGROOT.conf" | cut -d= -f3)"
+    [[ $PGROOT ]] || { [[ -s ${conf%.d} ]] && PGROOT="$(grep '^Environment=PGROOT=' "${conf%.d}" | cut -d= -f3)"; }
+    old_version="$(pacman -Q postgresql 2>/dev/null | grep 'postgresql ' | cut -d' ' -f2 | cut -d. -f1)"
+    [[ $old_version ]] && [[ -z $PGROOT ]] && PGROOT=/var/lib/postgres
+    [[ $PGROOT ]] || PGROOT=/var/postgres
+    version="$(pacman -Ss postgresql | grep '/postgresql ' | cut -d' ' -f2 | cut -d. -f1)"
+    if [[ $old_version ]] && [[ $version != "$old_version" ]]; then
+        # Upgrading major version
+        sudo systemctl stop postgresql.service
+        UPGRADE=1
+        PGROOT="${PGROOT/$old_version/}"
+    elif [[ $old_version ]]; then
+        if [[ -d $PGROOT/$old_version/data ]]; then
+            echo "PostgreSQL $version is already installed."
+            return 0
+        else
+            #while [[ ! -d ${PGROOT/$old_version/}/$old_version/data ]]; do ((old_version--)); done
+            old_version="$(sudo cat "$PGROOT/data/PG_VERSION")"
+            if ((old_version == version - 1)); then
+                sudo pacman -S --noconfirm --needed postgresql-old-upgrade
+            elif ((old_version == version - 2)); then
+                install_aur_pkg -q postgresql-old-upgrade
+            else
+                install_aur_pkg -q "postgresql-$old_version-upgrade"
+            fi
+            systemctl -q is-active postgresql.service && sudo systemctl -q stop postgresql.service
+            UPGRADE=1
+            PGROOT="${PGROOT/$old_version/}"
+        fi
+    fi
+    # install newest postgresql with some python tools
+    sudo pacman -Sq --noconfirm --needed postgresql python-setuptools python-pip python-pipx
+    if [[ -z $UPGRADE ]]; then
+        echo -e "\nPostgreSQL data root directory is ${C}${PGROOT}${NC}"
+        read -rp "If you want some other data root directory for PostgreSQL, enter the path: "
+        PGROOT="${REPLY:-$PGROOT}"
+        PGROOT="${PGROOT%/"${version}"/data}"
+        [[ $PGROOT ]] || PGROOT=/var/postgres
+        if [[ $(findmnt -no FSTYPE /) == "btrfs" ]]; then
+            [[ -d $PGROOT ]] || sudo btrfs subvol create "$PGROOT"
+            lsattr -dl "$PGROOT" | grep -qw No_COW || sudo chattr +C "$PGROOT"
+        else
+            [[ -d $PGROOT ]] || mkdir -p "$PGROOT"
+        fi
+        # prepare for pgadmin4
+        [[ -d /etc/pgadmin ]] || sudo install -d /etc/pgadmin
+        [[ -d $HOME/.local/share/pgadmin ]] || install -d "$HOME"/.local/share/pgadmin
+        [[ -e /etc/pgadmin/config_system.py ]] || echo -e "import os.path\nDATA_DIR = os.path.realpath(os.path.expanduser('~/.local/share/pgadmin/'))" | sudo tee /etc/pgadmin/config_system.py >/dev/null
+        #pipx install pgadmin4
+        log "PostgreSQL ${version} is installed.\n  You may also want to install ${W}pgadmin4${NC} with:\n\tpipx ensurepath; pipx install pgadmin4" \
+            "Check PostgreSQL first-steps at\nhttps://wiki.archlinux.org/title/PostgreSQL#Create_your_first_database/user"
+    fi
+    [[ -d $PGROOT/$version/data ]] || sudo mkdir -p "$PGROOT/$version/data"
+    sudo chown -R postgres:postgres "$PGROOT"
+    if [[ $UPGRADE ]]; then
+        sudo test -e "$PGROOT/$old_version/info.txt" && cmd="$(sudo grep -o '# sudo .*' "$PGROOT/$old_version/info.txt")" && cmd="${cmd#\# }"
+        # shellcheck disable=SC2086
+        [[ $cmd ]] && cmd="${cmd/$old_version/$version}" && $cmd &&\
+          echo -e "# This PostgreSQL ${version} cluster was initialized using:\n# $cmd" | sudo -u postgres tee "$PGROOT/$version/info.txt" >/dev/null
+    fi
+    if [[ -z $UPGRADE ]] || ! sudo test -e "$PGROOT/$version/info.txt"; then
+        opt=(--data-checksums)
+        [[ $LANG == *.UTF-8 ]] && opt+=(--encoding=UTF8)
+        cmd=(sudo -u postgres initdb -D "${PGROOT}/${version}/data" "${opt[@]}")
+        sudo test -e "$PGROOT/$version/data/postmaster.pid" || "${cmd[@]}"
+        echo -e "# This PostgreSQL ${version} cluster was initialized using:\n# ${cmd[*]}" | sudo -u postgres tee "$PGROOT/$version/info.txt" >/dev/null
+    fi
+    sudo chown -R postgres:postgres "$PGROOT/$version"/*
+    if [[ $UPGRADE ]]; then
+        OLDPGBIN="/opt/pgsql-$old_version/bin"
+        OLDPGDATA="$PGROOT/$old_version/data"
+        NEWPGBIN="/usr/bin"
+        NEWPGDATA="$PGROOT/$version/data"
+        echo -e "\nChecking if pg_upgrade can upgrade the database"
+        sudo -u postgres /usr/bin/pg_upgrade -b "$OLDPGBIN" -B "$NEWPGBIN" -d "$OLDPGDATA" -D "$NEWPGDATA" --check
+        read -rp "Do you want to upgrade the database? [y/N] "
+        if [[ ${REPLY,,} =~ ^y(es)? ]]; then
+            sudo -u postgres /usr/bin/pg_upgrade -b "$OLDPGBIN" -B "$NEWPGBIN" -d "$OLDPGDATA" -D "$NEWPGDATA"
+            sudo sed -i "s/$old_version/$version/" "$conf/PGROOT.conf"
+            log "PostgreSQL $version is now upgraded."
+        fi
+    fi
+    [[ -d "$conf" ]] || sudo mkdir "$conf"
+    echo \
+"[Service]
+Environment=PGROOT=${PGROOT}/${version}
+PIDFile=${PGROOT}/${version}/data/postmaster.pid" | sudo tee "$conf/PGROOT.conf" > /dev/null
+    [[ $PGROOT == /home/* ]] && echo "ProtectHome=false" | sudo tee -a "$conf/PGROOT.conf" > /dev/null
+    systemctl -q is-enabled postgresql.service && sudo systemctl -q restart postgresql.service || sudo systemctl -q enable --now postgresql.service
+}
+
+install_rofi() {
+    # Install rofi after you have booted into graphical UI
+    local c
+    sudo pacman -Sq --noconfirm --needed rofi
+    c="${XDG_CONFIG_HOME:-/home/$USR/.config}"
+    [ -d "${c}/rofi" ] || mkdir -p "${c}/rofi/themes"
+    [ -s "${c}/rofi/config.rasi" ] || rofi -dump-config > "${c}/rofi/config.rasi"
+    grep -q '^@theme' "${c}/rofi/config.rasi" || echo '@theme "/usr/share/rofi/themes/dmenu.rasi"' >> "${c}/rofi/config.rasi"
+    if [[ $1 == "-qtile" ]] && [[ -s "${c}/qtile/config.py" ]] && ! grep -q 'rofi -show' "${c}/qtile/config.py"; then
+        echo "Setting up rofi for Qtile."
+        sed -i 's/Key.*lazy.spawncmd/#&/' "${c}/qtile/config.py"
+        sed -i '/lazy.spawncmd/a Key([mod], "p", lazy.spawn("rofi -show drun -show-icons -display-drun \\\"Drun: \\\""), desc="rofi drun"),' "${c}/qtile/config.py"
+        sed -i '/lazy.spawncmd/a Key([mod], "r", lazy.spawn("rofi -show run -display-run \\\"Run: \\\""), desc="rofi run"),' "${c}/qtile/config.py"
+        sed -i '/rofi -show/s/^K/    K/' "${c}/qtile/config.py"
+    fi
+    log "Rofi is installed. Rofi configuration is in ~/.config/rofi/config.rasi" \
+        "Select rofi theme with ${W}rofi-theme-selector${NC}"
+}
+
+install_nitrogen() {
+    local c
+    sudo pacman -Sq --noconfirm --needed nitrogen archlinux-wallpaper || return 1
+    c="${XDG_CONFIG_HOME:-/home/$USR/.config}/nitrogen"
+    # the default desktop image:
+    local desktop_image=/usr/share/backgrounds/archlinux/landscape.jpg
+
+    [[ -d $c ]] || mkdir "$c"
+    [[ -s "${c}/bg_saved.cfg" ]] || echo -e "[xin_-1]\nfile=${desktop_image}\nmode=5\nbgcolor=#000000" > "${c}/bg-saved.cfg"
+    [[ -s "${c}/nitrogen.cfg" ]] || { echo -e "[geometry]\nposx=12\nposy=36\nsizex=1000\nsizey=700\n" > "${c}/nitrogen.cfg";
+      echo -e "[nitrogen]\nview=icon\nrecurse=true\nsort=alpha\nicon_caps=false\ndirs=$(dirname "$desktop_image");" >> "${c}/nitrogen.cfg"; }
+    touch "/home/$USR/.xprofile"
+    grep -q '^nitrogen --restore' "/home/$USR/.xprofile" || echo "nitrogen --restore &" >> "/home/$USR/.xprofile"
+}
+
+# Detects autologin on display managers LightDM, SDDM and GDM
+# If autologin is enabled, sets variable autologin to value "session:user" where "session" is
+# the enabled desktop environment and "user" is the username who is enabled to autologin.
+detect_autologin() {
+    local dm dt t noLog
+    systemctl -q is-enabled display-manager 2>/dev/null || { unset autologin; return 1; }
+    [[ $1 == '-q' ]] && noLog=1
+    dm="$(systemctl status display-manager | awk 'NR==1 {print $2}')"
+    case "${dm%.*}" in
+      lightdm)
+        t="$(find /etc/lightdm/lightdm.conf.d -type f -name "70-*.conf"|tail -n 1)"
+        [[ $t ]] && autologin="$(awk -F= '$1=="autologin-user" {print $2}' "$t")"
+        [[ $autologin ]] && t="${t#*70-}" && autologin="${t%.conf}:$autologin"
+        ;;
+      sddm)
+        [[ -s /etc/sddm.conf.d/autologin.conf ]] && autologin=$(awk -F= '$1=="User" {u=$2} $1=="Session" {s=$2} END {if (s && u) print s":"u}' /etc/sddm.conf.d/autologin.conf)
+        ;;
+      gdm)
+        autologin=$(awk -F= '$1=="AutomaticLogin" {u=$2} $1=="AutomaticLoginEnable" {if ($2 ~ /[Tt]rue/) s=1} END {if (s && u) print ":" u}' /etc/gdm/custom.conf)
+        if [[ ${autologin:0:1} == ':' ]]; then
+           dt=$(sudo awk -F= '$1=="XSession" {print $2}' "/var/lib/AccountsService/users/${autologin#:}" 2>/dev/null)
+           [[ $dt ]] && autologin="${dt%-xorg}${autologin}" || autologin="Gnome${autologin}"
+        fi
+        ;;
+      *)
+        autologin=
+        ;;
+    esac
+    if [[ $autologin ]]; then
+         [[ -z "$noLog" ]] && log "Detected autologin $autologin"
+         return 0
+    fi
+    return 1
+}
+
+# install_autologin <desktop>
+# where <desktop> must be the active desktop e.g. cinnamon
+# Hint: autologin may be desired particularly when full disk encryption is in use
+install_autologin() {
+    local gs
+    [[ $1 ]] || return 1
+    detect_autologin && return 0
+    if systemctl is-enabled -q systemd-homed &>/dev/null; then
+        log "Autologin is \e[1;37munavailable\e[0m on systemd-homed."
+    elif systemctl is-enabled -q lightdm &>/dev/null; then
+        echo "Enabling autologin with LightDM"
+        grep -qG "autologin:.*[:,]$USR" /etc/group || sudo gpasswd -a "$USR" autologin
+        [[ -s "/etc/lightdm/lightdm.conf.d/70-$1.conf" ]] || return 1
+        grep -qG "^autologin-user=$USR" "/etc/lightdm/lightdm.conf.d/70-$1.conf" ||
+        { echo "autologin-user=$USR" | sudo tee -a "/etc/lightdm/lightdm.conf.d/70-$1.conf" > /dev/null &&
+          log "Autologin into ${1^} enabled for user $USR" && autologin="$1:$USR"; }
+    elif systemctl -q is-enabled sddm &>/dev/null; then
+        echo "Enabling autologin with SDDM"
+        [[ -s /etc/sddm.conf.d/autologin.conf ]] && sudo sed -Ei "s/(#?Session)=.*/\1=$1/" /etc/sddm.conf.d/autologin.conf &&
+        sudo sed -Ei "s/(#?User)=.*/\1=$USR/" /etc/sddm.conf.d/autologin.conf &&
+        sudo sed -i 's/^#//' /etc/sddm.conf.d/autologin.conf &&
+        log "Autologin into ${1^} enabled for user $USR" && autologin="$1:$USR"
+    elif systemctl is-enabled -q gdm &>/dev/null; then
+        echo "Enabling autologin with GDM"
+        sudo sed -Ei "s/#*(AutomaticLogin)=.*/\1=$USR/" /etc/gdm/custom.conf
+        sudo sed -Ei 's/#*(AutomaticLoginEnable)=.*/\1=true/' /etc/gdm/custom.conf
+        if [[ ${1,,} == gnome ]]; then
+            gs=gnome
+            grep -qxG '#WaylandEnable=[Ff]alse' /etc/gdm/custom.conf || gs=gnome-xorg
+            sudo find "/var/lib/AccountsService/users/$USR" -type f &>/dev/null &&
+              sudo sed -Ei "s/(XSession)=.*/\1=$gs/" "/var/lib/AccountsService/users/$USR"
+        else
+            sudo sed -Ei "s/(XSession)=.*/\1=$1/" "/var/lib/AccountsService/users/$USR"
+        fi
+        log "Autologin into ${1^} enabled for user $USR"
+        autologin="$1:$USR"
+    else
+        autologin=
+        log "Autologin is available only for display managers LightDM, SDDM and GDM."
+    fi
+    [[ $autologin ]] && return 0 || return 1
+}
+
+install_lightdm() {
+    local greeter greeter_conf bg_image
+    while [[ $1 ]]; do
+       [[ $1 != "--" ]] && greeter="$1"
+       shift
+    done
+    [[ $greeter == aether ]] && sudo pacman -Sq --noconfirm --needed lightdm lightdm-gtk-greeter lightdm-webkit2-greeter ||\
+       sudo pacman -Sq --noconfirm --needed lightdm lightdm-gtk-greeter lightdm-gtk-greeter-settings lightdm-slick-greeter accountsservice
+    [[ -d /etc/lightdm/lightdm.conf.d ]] || sudo install -dm755 /etc/lightdm/lightdm.conf.d
+    # for virtual machines set the desired display resolution:
+    systemd-detect-virt -q && \
+      [[ ! -s /etc/lightdm/lightdm.conf.d/10-display-mode.conf ]] &&
+      echo -e "[Seat:*]\ndisplay-setup-script=xrandr --output Virtual-1 --mode $VIRT_RESOLUTION" | sudo tee /etc/lightdm/lightdm.conf.d/10-display-mode.conf >/dev/null
+    if [[ $greeter == aether ]]; then
+        install_aur_pkg -q lightdm-webkit-theme-aether
+        greeter="webkit2"
+    else
+        greeter="${greeter:-gtk}"
+        [[ $greeter == gtk ]] && greeter_conf=/etc/lightdm/lightdm-gtk-greeter.conf.d/30-gtk-greeter.conf || greeter_conf="/etc/lightdm/${greeter}-greeter.conf"
+        [[ -d "$(dirname "$greeter_conf")" ]] || sudo mkdir -p "$(dirname "$greeter_conf")"
+        echo "[greeter]" | sudo tee "$greeter_conf" > /dev/null
+    fi
+    if [[ $greeter ]]; then
+        [[ -s /etc/lightdm/lightdm.conf.d/20-greeter.conf ]] &&
+          sudo sed -Ei "s/^(greeter-session)=.*/\1=lightdm-${greeter}-greeter/" /etc/lightdm/lightdm.conf.d/20-greeter.conf ||
+          echo -e "[Seat:*]\ngreeter-session=lightdm-${greeter}-greeter" | sudo tee /etc/lightdm/lightdm.conf.d/20-greeter.conf > /dev/null
+    fi
+    [[ $desktop == cinnamon ]] && bg_image="$(dconf read /org/cinnamon/desktop/background/picture-uri)" && bg_image="${bg_image//\'}" && bg_image="${bg_image#file://}"
+    [[ -z "$bg_image" ]] && [[ -s "/home/$USR/.config/nitrogen/bg_saved.cfg" ]] && bg_image="$(awk -F= '$1=="file" {print $2}' "/home/$USR/.config/nitrogen/bg_saved.cfg")"
+    if [[ -n "$bg_image" && $greeter == gtk ]] || [[ -n "$bg_image" && $greeter == slick ]]; then
+        grep -q "^background=" "$greeter_conf" &&
+          sudo sed -Ei "s/^(background)=.*/\1=${bg_image}/" "$greeter_conf" ||
+          echo "background=${bg_image}" | sudo tee -a "$greeter_conf" > /dev/null
+    fi
+    pacman -Q xorg-server &> /dev/null && set_xkeymap
+    # Note: user must be member of group 'autologin' to be able to use lightdm's autologin.
+    sudo grep -qwF autologin /etc/group || sudo groupadd -r autologin
+    [[ -n "$desktop" ]] && echo -e "[Seat:*]\nallow-guest=false\nuser-session=$desktop" | sudo tee "/etc/lightdm/lightdm.conf.d/70-${desktop}.conf" >/dev/null
+    systemctl is-enabled -q lightdm || sudo systemctl enable -f lightdm
+}
+
+install_sddm() {
+    sudo pacman -Sq --noconfirm --needed sddm
+    systemd-detect-virt -q && sudo pacman -Sq --noconfirm --needed haveged && sudo systemctl enable haveged
+    [[ -d /etc/sddm.conf.d ]] || sudo install -d /etc/sddm.conf.d
+
+    # sugar-candy theme:
+    sudo pacman -Sq --noconfirm --needed qt5-graphicaleffects qt5-quickcontrols qt5-svg
+    if install_aur_pkg -q sddm-sugar-candy-git; then
+        [[ ! -s /etc/sddm.conf.d/theme.conf ]] && echo -e "[Theme]\nCurrent=sugar-candy\n# Check sugar-candy settings: https://store.kde.org/p/1312658/" | sudo tee /etc/sddm.conf.d/theme.conf > /dev/null
+    elif install_aur_pkg -q sddm-theme-sugar-candy-git; then
+        [[ ! -s /etc/sddm.conf.d/theme.conf ]] && echo -e "[Theme]\nCurrent=Sugar-Candy\n# Check sugar-candy settings: https://store.kde.org/p/1312658/" | sudo tee /etc/sddm.conf.d/theme.conf > /dev/null
+    fi
+
+    [[ -s /etc/sddm.conf.d/users.conf ]] || echo -e "[Users]\nHideShells=/usr/bin/nologin,/sbin/nologin,/bin/false,/usr/bin/git-shell" | sudo tee /etc/sddm.conf.d/users.conf > /dev/null
+    [[ -s /etc/sddm.conf.d/avatar.conf ]] || echo -e "[Theme]\nEnableAvatars=false" | sudo tee /etc/sddm.conf.d/avatar.conf > /dev/null
+    [[ -s /etc/sddm.conf.d/general.conf ]] || echo -e "[General]\nNumlock=on" | sudo tee /etc/sddm.conf.d/general.conf > /dev/null
+    if systemd-detect-virt -q; then
+        grep -qG "^DisplayServer=" /etc/sddm.conf.d/general.conf || echo -e "# Set default to X11 (not wayland)\nDisplayServer=X11" | sudo tee -a /etc/sddm.conf.d/general.conf > /dev/null
+        grep -qG "^DisplayCommand=" /etc/sddm.conf.d/general.conf || echo -e "DisplayCommand=\"xrandr --output $(xrandr -q | awk 'NR<6 && $2=="connected" {d=$1} END {print d?d:"Virtual-1"}') --mode $VIRT_RESOLUTION\"" | sudo tee -a /etc/sddm.conf.d/general.conf > /dev/null
+        [[ -s /etc/sddm.conf.d/theme.conf ]] && ! grep -q "^ScreenWidth=" /etc/sddm.conf.d/theme.conf && echo -e "\n[General]\nScreenWidth=\"${VIRT_RESOLUTION%x*}\"\nScreenHeight=\"${VIRT_RESOLUTION#*x}\"" | sudo tee -a /etc/sddm.conf.d/theme.conf > /dev/null
+    else
+        [[ -s /etc/sddm.conf.d/hidpi.conf ]] || echo -e "[Wayland]\nEnableHiDPI=true\n\n[X11]\nEnableHiDPI=true" | sudo tee /etc/sddm.conf.d/hidpi.conf > /dev/null
+    fi
+    [[ -s /etc/sddm.conf.d/autologin.conf ]] || echo -e "#[Autologin]\n#User=$USR\n#Session=$desktop" | sudo tee /etc/sddm.conf.d/autologin.conf > /dev/null
+    pacman -Q xorg-server &> /dev/null && [[ $KEYMAP != us ]] && sudo localectl set-x11-keymap "$KEYMAP"
+    systemctl is-enabled -q sddm || sudo systemctl enable -f sddm
+}
+
+install_gdm() {
+    sudo pacman -Sq --noconfirm --needed gdm
+    grep -Eq "^#?AutomaticLoginEnable=" /etc/gdm/custom.conf ||
+      sudo sed -i '/\[daemon\]/,/^$/s/^$/#AutomaticLogin=\n#AutomaticLoginEnable=false\n&/' /etc/gdm/custom.conf
+    set_xkeymap
+    sudo systemctl enable -f gdm
+    # gdm does not work nicely with motd (shows it kind of "badly")
+    sudo rm -f /etc/motd
+}
+install_display-manager() {
+  local dt="${desktop^}"
+  dt="${desktop:-the desktop}"
+  if ! systemctl is-enabled -q display-manager &>/dev/null; then
+      echo -e "\nA display manager is needed to start $dt. Select display manager:"
+
+      select _ in LightDM SDDM GDM; do break; done
+      case "$REPLY" in
+        1) install_lightdm --; log "LightDM is now enabled.";;
+        2) install_sddm; log "SDDM is now enabled.";;
+        3) install_gdm; log "GDM is now enabled.";; 
+        *) log "Warning, $dt won't start, unless you install a display manager, or start it manually.";;
+      esac
+  fi
+}
+
+install_cinnamon() {
+
+    pacman -Q xf86-video-intel &> /dev/null && sudo pacman -R --noconfirm xf86-video-intel
+    set -e
+    # These are installed always:
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps cinnamon cinnamon-translations nemo-fileroller nemo-preview xed xreader metacity gnome-keyring gnome-packagekit xdg-desktop-portal-gtk gucharmap seahorse nemo-seahorse gnome-disk-utility arc-gtk-theme papirus-icon-theme polkit-gnome gnome-screenshot eog eog-plugins
+    command -v kitty || command -v alacritty || install_aur_pkg -q gnome-terminal-transparency
+    install_aur_pkg -q xcursor-dmz cinnamon-remove-application
+
+    # If NOT in a VM, install these:
+    systemd-detect-virt -q || sudo pacman -S --noconfirm --needed blueman simple-scan
+    
+    set +e
+    [[ -d "/home/$USR/.local/share/nemo/actions" ]] || mkdir -p "/home/$USR/.local/share/nemo/actions"
+    command -v meld &>/dev/null && echo -e "[Nemo Action]\nName[en]=Compare...\nName[fi]=Vertaile...\nComment[en]=Compare files with meld\n\nComment[fi]=Vertaile tiedostoja meld ohjelmalla\nExec=meld %F\nSelection=m\nExtensions=any;\nTerminal=false" > "/home/$USR/.local/share/nemo/actions/compare.nemo_action"
+
+    # Unless some image is the background, set some default background:
+    dconf read /org/cinnamon/desktop/background/picture-uri | grep -Eq "(jpg'|png'|webp')" || \
+    dconf write /org/cinnamon/desktop/background/picture-uri "'file:///usr/share/backgrounds/gnome/adwaita-d.webp'"
+
+    if systemctl is-active cups.service -q || systemctl is-active cups.socket -q; then
+        sudo pacman -Sq --noconfirm --needed system-config-printer
+    fi
+    if ! systemctl is-enabled -q display-manager &>/dev/null; then
+        install_display-manager
+    fi
+    log "Please, reboot to start Cinnamon."
+}
+
+install_plasma() {
+    # KDE Plasma should have sddm
+    install_sddm
+    set -e
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps plasma-meta plasma-wayland-session xdg-desktop-portal-kde kde-gtk-config packagekit-qt5 konsole dolphin kate okular plasma-nm kdeplasma-addons kcharselect cryfs encfs gocryptfs kdialog spectacle partitionmanager filelight
+   
+    if [[ $SAMBA ]] || [[ -s /etc/samba/smb.conf ]]; then
+        sudo pacman -Sq --noconfirm --needed kdenetwork-filesharing
+    fi
+
+    # if NOT in a VM, install additionally:
+    systemd-detect-virt -q || sudo pacman -Sq --noconfirm --needed skanlite colord-kde
+
+    # Want lots of KDE software?
+    [[ $1 == full ]] && sudo pacman -S kde-applications
+
+    set +e
+    sudo sed -i '/Session=/s/=.*/=plasma/' /etc/sddm.conf.d/autologin.conf
+    #lsblk | grep -qw crypt && install_autologin plasma
+
+    log "Please, reboot to start KDE Plasma."
+}
+
+install_kde() {
+    install_plasma "$@"
+}
+
+install_gnome() {
+    local term
+    set -e
+    # always install these:
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps gnome gnome-disk-utility gnome-tweaks gnome-packagekit gnome-software gnome-text-editor gnome-browser-connector archlinux-appstream-data xdg-desktop-portal-gnome gucharmap seahorse gedit gedit-plugins gst-plugin-pipewire dconf-editor nautilus-image-converter
+    # Many apps still default to using 'gnome-terminal'. Maybe this could be removed?
+    sudo pacman -Sq --noconfirm --needed gnome-terminal
+    # if not virtual machine, install these:
+    systemd-detect-virt -q || sudo pacman -Sq --noconfirm --needed simple-scan
+    set +e
+    # Set the default terminal
+    command -v kitty && term='kitty'
+    [[ $term ]] || command -v alacritty && term='alacritty'
+    [[ $term ]] || term='gnome-console'
+    # in gnome 43 by default this was still 'gnome-terminal'
+    gsettings set org.gnome.desktop.default-applications.terminal exec "$term"
+    # week numbers in calendar
+    gsettings set org.gnome.desktop.calendar show-weekdate true
+    # prefer dark theme
+    gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+    gsettings set org.gnome.desktop.interface gtk-theme Adwaita-dark
+    gsettings set org.gnome.shell disable-user-extensions false
+    # fix kitty on gnome wayland
+    [[ -e ~/.config/kitty/kitty.conf ]] && sed -i '/linux_display_server auto/a linux_display_server x11' ~/.config/kitty/kitty.conf
+    
+
+    # GDM is by default the display manager in Gnome
+    install_gdm
+
+    install_aur_pkg -q gnome-shell-extension-pop-shell-bin
+    install_aur_pkg -q gnome-shell-extension-arch-update
+
+    # Lots of packages to choose from:
+    [[ $1 == full ]] && sudo pacman -S gnome-extra
+
+    # Nvidia and VirtualBox don't "like" Wayland, so disable Wayland if any of those detected.
+    # You may enable wayland yourself by commenting out 'WaylandEnable=false' in /etc/gdm/custom.conf
+    #if [[ $(systemd-detect-virt) == "oracle" ]] || lspci | grep -Eiq '(VGA|3D).*nvidia'; then
+    #    sudo sed -Ei 's/^#?(WaylandEnable)=.*/\1=false/' /etc/gdm/custom.conf
+    #fi
+    set_xkeymap
+    log "Please, reboot to start GNOME."
+}
+
+install_mate() {
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps mate xdg-desktop-portal-gtk arc-gtk-theme papirus-icon-theme
+    systemd-detect-virt -q || sudo pacman -Sq --noconfirm --needed simple-scan
+    if systemctl is-active cups.service -q || systemctl is-active cups.socket -q; then
+        sudo pacman -Sq --noconfirm --needed system-config-printer
+    fi
+    [[ $1 == full ]] && sudo pacman -S mate-extra
+    set_xkeymap
+    if ! systemctl is-enabled -q display-manager &>/dev/null; then
+        install_display-manager
+    fi
+    log "Please, reboot to start MATE."
+}
+
+install_xfce() {
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps xfce4 xfce4-goodies xdg-desktop-portal-gtk arc-gtk-theme papirus-icon-theme
+    systemd-detect-virt -q || sudo pacman -Sq --noconfirm --needed simple-scan
+    install_aur_pkg -q ocs-url
+    set_xkeymap
+
+    if ! systemctl is-enabled -q display-manager &>/dev/null; then
+        install_display-manager
+    fi
+    log "Xfce themes etc. can be found at https://xfce-look.org\n  Please, reboot to start Xfce."
+}
+
+install_lxqt() {
+    sudo pacman -Sq --noconfirm --needed xorg-server lxqt xdg-desktop-portal-lxqt arc-gtk-theme papirus-icon-theme kvantum xscreensaver
+    install_aur_pkg -q kvantum-theme-arc arc-kde
+    systemctl -q is-enabled NetworkManager && install_aur_pkg -q nm-tray
+    if ! systemctl is-enabled -q display-manager &>/dev/null; then
+        install_display-manager
+    fi
+    log "Please, reboot to start LXQt."
+}
+
+install_dwm() {
+    [[ -d "/home/$USR/dwm" ]] && return 1
+    mkdir "/home/$USR/dwm"
+    local plist=(
+      dmenu
+      dwm
+      dwmstatus
+      st
+      slock
+    )
+    for p in "${plist[@]}"; do
+        git clone "https://git.suckless.org/$p" "/home/$USR/dwm/$p"
+        make -C "/home/$USR/dwm/$p"
+        sudo make -C "/home/$USR/dwm/$p" install
+    done
+    [[ -d /usr/share/xsessions ]] || sudo mkdir /usr/share/xsessions
+    echo -e "[Desktop Entry]\nEncoding=UTF-8\nName=Dwm\nComment=Dynamic window manager\nExec=dwm\nIcon=dwm\nType=XSession" | sudo tee /usr/share/xsessions/dwm.desktop &>/dev/null
+
+    systemctl -q is-enabled display-manager || { install_aur_pkg -q ly && sudo systemctl enable ly; }
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps lxappearance pcmanfm vifm
+
+    touch "/home/$USR/.xprofile"
+    set_xkeymap
+    install_nitrogen
+    install_rofi
+    if systemd-detect-virt -q; then
+        grep -qG '^xrandr ' "/home/$USR/.xprofile" || echo "xrandr --output $(xrandr -q|awk 'NR<6 && $2=="connected" {d=$1} END {print d?d:"Virtual-1"}') --mode ${VIRT_RESOLUTION:-1920x1080}" >> "/home/$USR/.xprofile"
+    fi
+    log "Dwm is installed. All dwm sources are in ~/dwm/"
+}
+
+install_qtile() {
+    local f iface
+    pacman -Q qtile &>/dev/null && return 1
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps qtile xdg-desktop-portal-gtk python-pip python-psutil lxappearance lxsession-gtk3 galculator pcmanfm feh vifm
+    #install_aur_pkg -q picom-git
+    sudo pacman -Sq --noconfirm --needed picom
+    #install_aur_pkg otf-inconsolata-powerline-git
+    f="${XDG_CONFIG_HOME:-/home/$USR/.config}/qtile/config.py"
+    [[ -d "$(dirname "$f")" ]] || mkdir -p "$(dirname "$f")"
+    cp /usr/share/doc/qtile/default_config.py "$f"
+    command -v alacritty && sed -Ei 's/^(terminal) ?=.*/\1 = "alacritty"/' "$f"
+    command -v kitty && sed -Ei 's/^(terminal) ?=.*/\1 = "kitty"/' "$f"
+    sed -i 's/%I:%M %p/%H:%M/' "$f"
+    sed -i 's/%Y-%m-%d %a/%a %d.%m.%Y,/' "$f"
+    #sed -i 's/layout.Columns/# &/' "$f"
+    #sed -i 's/layout.Max/# &/' "$f"
+    # margin=6 gives gaps
+    sed -i '/layout.Columns/s/)/, margin=6)/' "$f"
+    sed -Ei 's/# (layout.Monad[TW].*)\(/\1(margin=6/' "$f"
+    sed -i 's/bottom=bar/top=bar/' "$f"
+    sed -i '/switch_group/s/True/False/' "$f"
+    sed -i 's/[Ss]witch to & //' "$f"
+    sed -i 's/mod\], "w"/mod], "c"/' "$f"
+    sed -i '/lazy.layout.normalize/a Key([mod], "m", lazy.window.toggle_maximize(), desc="Toggle maximize window"),' "$f"
+    sed -i '/toggle_maximize/s/^K/    K/' "$f"
+    # panel (Screen as qtile calls it)
+    sed -i '/Box("/s/widget/# widget/' "$f"
+    iface="$(ip -br li | awk '$2=="UP" {print $1}' | head -1)"
+    [[ $iface ]] && sed -i "/Systray()/i widget.Net(interface=\"${iface}\")," "$f"
+    [[ $iface ]] && sed -i "/${iface}/s/^/                /" "$f"
+    
+    if install_aur_pkg -q oblogout-py3-git && command -v oblogout &>/dev/null; then
+        sed -i 's/Key.*lazy.shutdown/#&/' "$f"
+        sed -i '/lazy.shutdown/a Key([mod, "shift"], "q", lazy.spawn("oblogout"), desc="Shutdown menu"),' "$f"
+        sed -i '/"oblogout"/s/^K/    K/' "$f"
+    fi
+
+    [[ -d "${XDG_CONFIG_HOME:-/home/$USR/.config}/picom" ]] || mkdir "${XDG_CONFIG_HOME:-/home/$USR/.config}/picom"
+    [[ -s "${XDG_CONFIG_HOME:-/home/$USR/.config}/picom/picom.conf" ]] || cp /etc/xdg/picom.conf* "${XDG_CONFIG_HOME:-/home/$USR/.config}/picom/picom.conf"
+    sed -Ei 's/^(shadow-radius) =.*/\1 = 12;/' "${XDG_CONFIG_HOME:-/home/$USR/.config}/picom/picom.conf"
+    if systemd-detect-virt -q; then
+        sed -Ei 's/^(vsync) ?=.*/\1 = false/' "${XDG_CONFIG_HOME:-/home/$USR/.config}/picom/picom.conf"
+        # If lighdm or sddm is not used, probably need to set display resolution using xrandr
+        if ! systemctl is-enabled -q lightdm; then
+            touch "/home/$USR/.xprofile"
+            grep -q '^xrandr --output ' "/home/$USR/.xprofile" || echo "xrandr --output $(xrandr -q|awk 'NR<6 && $2=="connected" {d=$1} END {print d?d:"Virtual-1"}') --mode ${VIRT_RESOLUTION:-1920x1080}" >> "/home/$USR/.xprofile"
+        fi
+    fi
+    touch "/home/$USR/.xprofile"
+    set_xkeymap
+    install_nitrogen
+    #install_rofi -qtile
+
+    grep -q '^picom ' "/home/$USR/.xprofile" || echo "picom -f &" >> "/home/$USR/.xprofile"
+    systemctl is-enabled -q display-manager &>/dev/null || install_display-manager
+    log "Qtile configuration file is ~/.config/qtile/config.py\n  Full qtile documentation is at https://qtile.org\n  Please, reboot to start Qtile." \
+        "Important! After reboot, run: \n  $(basename "$0") rofi -qtile"
+    return 0
+
+# testing, not in use
+# shellcheck disable=SC2317
+    cat >> "$conf" << EOF
+floating_types = ["notification", "toolbar", "splash", "dialog"]
+follow_mouse_focus = True
+bring_front_click = False
+cursor_warp = False
+floating_layout = Layout.Floating(float_rules=[
+    {'wmclass': 'confirm'},
+    {'wmclass': 'dialog'},
+    {'wmclass': 'download'},
+    {'wmclass': 'error'},
+    {'wmclass': 'file_progress'},
+    {'wmclass': 'notification'},
+    {'wmclass': 'download'},
+    {'wmclass': 'splash'},
+    {'wmclass': 'toolbar'},
+    {'wmclass': 'confirmreset'},
+    {'wmclass': 'makebranch'},
+    {'wmclass': 'maketag'},
+    {'wmclass': 'Arandr'},
+    {'wmclass': 'feh'},
+    {'wmclass': 'Galculator'},
+    {'wmclass': 'Oblogout'},
+    {'wmclass': 'ssh-askpass'},
+    {'wname': 'branchdialog'},
+    {'wname': 'Open File'},
+    {'wname': 'pinentry'},
+
+], fullscreen_border_width = 0, border_width = 0)
+auto_fullscreen = True
+focus_on_window_activation = "smart"
+EOF
+}
+
+install_xmonad() {
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps xorg-xmessage xterm vifm pcmanfm lxappearance lxsession volumeicon xmonad xmonad-contrib xmobar xdotool dmenu gmrun galculator feh arc-gtk-theme papirus-icon-theme
+    #install_aur_pkg -q picom-git
+    sudo pacman -Sq --noconfirm --needed picom
+
+    local term="xterm"
+    { command -v kitty &> /dev/null && term="kitty"; } || \
+    { command -v alacritty &> /dev/null && term="alacritty"; }
+
+    # Works, but maybe "safer" not to enable this...
+    #[[ $XDG_CONFIG_HOME ]] && local xm=$XDG_CONFIG_HOME/xmonad/xmonad.hs || \
+    local xm="/home/$USR/.xmonad/xmonad.hs"
+
+    [[ -d "$(dirname "$xm")" ]] || mkdir -p "$(dirname "$xm")"
+    [[ -s "$xm" ]] || cat > "$xm" <<- EOF
+import XMonad
+import Data.Monoid
+import System.Exit
+import Graphics.X11.ExtraTypes.XF86
+import XMonad.Hooks.DynamicLog
+import XMonad.Layout.Spacing
+import XMonad.Layout.Maximize
+
+import qualified XMonad.StackSet as W
+import qualified Data.Map as M
+
+-- The preferred terminal program
+--
+myTerminal = "$term"
+
+-- Whether focus follows the mouse pointer
+--
+myFocusFollowsMouse :: Bool
+myFocusFollowsMouse = True
+
+-- Whether clicking on a window to focus also passes the click to the window
+--
+myClickJustFocuses :: Bool
+myClickJustFocuses = False
+
+-- Width of the window border in pixels
+--
+myBorderWidth = 2
+
+-- modMask lets you specify which modkey you want to use. The default
+-- is mod1Mask ("left alt"). You may also consider using mod3Mask
+-- ("right alt"), which does not conflict with emacs keybindings. The
+-- "windows key" is usually mod4Mask.
+--
+myModMask = mod4Mask
+
+-- The default number of workspaces (virtual screens) and their names.
+-- By default we use numeric strings, but any string may be used as a
+-- workspace name. The number of workspaces is determined by the length
+-- of this list.
+--
+-- A tagging example:
+--
+-- > workspaces = ["web", "irc", "code" ] ++ map show [4..9]
+--
+myWorkspaces  = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+-- Border colors for unfocused and focused windows
+--
+myNormalBorderColor  = "#2e3d48"
+myFocusedBorderColor = "#036ebe"
+
+-- Key bindings, Add, Modify or remove key bindings here.
+--
+myKeys conf@(XConfig {XMonad.modMask = modm}) = M.fromList \$
+
+    -- launch a terminal
+    [ ((modm, xK_Return), spawn \$ XMonad.terminal conf)
+
+    -- volume keys
+    , ((0, xF86XK_AudioMute), spawn "pactl set-sink-mute @DEFAULT_SINK@ toggle")
+    , ((0, xF86XK_AudioLowerVolume), spawn "pactl set-sink-volume @DEFAULT_SINK@ -10%")
+    , ((0, xF86XK_AudioRaiseVolume), spawn "pactl set-sink-volume @DEFAULT_SINK@ +10%")
+
+    -- launch dmenu
+    , ((modm, xK_p), spawn "dmenu_run")
+
+    -- launch gmrun
+    , ((modm .|. shiftMask, xK_p), spawn "gmrun")
+
+    -- close focused window
+    , ((modm .|. shiftMask, xK_c), kill)
+
+    -- Rotate through the available layout algorithms
+    , ((modm, xK_space), sendMessage NextLayout)
+
+    -- Reset the layouts on the current workspace to default
+    , ((modm .|. shiftMask, xK_space), setLayout \$ XMonad.layoutHook conf)
+
+    -- Resize viewed windows to the correct size
+    , ((modm, xK_n), refresh)
+
+    -- Move focus to the next window
+    , ((modm, xK_Tab), windows W.focusDown)
+
+    -- Move focus to the next window
+    , ((modm, xK_j), windows W.focusDown)
+
+    -- Move focus to the previous window
+    , ((modm, xK_k), windows W.focusUp)
+
+    -- Move focus to the master window
+    , ((modm, xK_m), windows W.focusMaster)
+
+    -- Swap the focused window with the master window
+    , ((modm .|. shiftMask, xK_Return), windows W.swapMaster)
+
+    -- Swap the focused window with the next window
+    , ((modm .|. shiftMask, xK_j), windows W.swapDown)
+
+    -- Swap the focused window with the previous window
+    , ((modm .|. shiftMask, xK_k), windows W.swapUp)
+
+    -- Shrink the master area
+    , ((modm, xK_h), sendMessage Shrink)
+
+    -- Expand the master area
+    , ((modm, xK_l), sendMessage Expand)
+
+    -- Push window back into tiling
+    , ((modm, xK_t), withFocused \$ windows . W.sink)
+
+    -- Maximize focused window
+    -- , ((modm, xK_backspace), withFocused (sendMessage . maximizeRestore))
+
+    -- Increment the number of windows in the master area
+    , ((modm, xK_comma), sendMessage (IncMasterN 1))
+
+    -- Decrement the number of windows in the master area
+    , ((modm, xK_period), sendMessage (IncMasterN (-1)))
+
+    -- Toggle the status bar gap
+    -- Use this binding with avoidStruts from Hooks.ManageDocks.
+    -- See also the statusBar function from Hooks.DynamicLog.
+    -- , ((modm, xK_b), sendMessage ToggleStruts)
+
+    -- Quit xmonad
+    , ((modm .|. shiftMask, xK_q), io (exitWith ExitSuccess))
+
+    -- Restart xmonad
+    , ((modm, xK_q), spawn "xmonad --recompile; xmonad --restart")
+
+    -- Run xmessage with a summary of the default keybindings (useful for beginners)
+    , ((modm .|. shiftMask, xK_h), spawn ("echo \\"" ++ help ++ "\\" | xmessage -file -"))
+    ]
+    ++
+
+    --
+    -- mod-[1..9], Switch to workspace N
+    -- mod-shift-[1..9], Move client to workspace N
+    [((m .|. modm, k), windows \$ f i)
+        | (i, k) <- zip(XMonad.workspaces conf) [xK_1 .. xK_9]
+        , (f, m) <- [(W.greedyView, 0), (W.shift, shiftMask)]]
+    ++
+
+    -- mod-{w,e,r}, Switch to physical/Xinerama screens 1, 2, or 3
+    -- mod-shift-{w,e,r}, Move client to screen 1,2, or 3
+    [((m .|. modm, key), screenWorkspace sc >>= flip whenJust (windows . f))
+        | (key, sc) <- zip [xK_w, xK_e, xK_r] [0..]
+        , (f, m) <- [(W.view, 0), (W.shift, shiftMask)]]
+
+-------------------------------------------------------------------------------
+-- Mouse bindings: default actions bound to mouse events
+--
+myMouseBindings (XConfig {XMonad.modMask = modm}) = M.fromList \$
+
+    -- mod-button1, Set the window to floating mode and move by dragging
+    [ ((modm, button1), (\\w -> focus w >> mouseMoveWindow w
+                                        >> windows W.shiftMaster))
+
+    -- mod-button2, Raise the window to the top of the stack
+    , ((modm, button2), (\\w -> focus w >> windows W.shiftMaster))
+
+    -- mod-button3, Set the window to floating mode and resize by dragging
+    , ((modm, button3), (\\w -> focus w >> mouseResizeWindow w
+                                        >> windows W.shiftMaster))
+
+    -- you may also bind events to the mouse scroll wheel (button4 and button5)
+    ]
+
+-------------------------------------------------------------------------------
+-- Layouts:
+
+-- You can specify and transform your layouts by modifyiong these values.
+-- If you change layout bindings, be sure to use 'mod-shift-space' after
+-- restarting (with 'mod-q') to reset your layout state to the new
+-- defaults, as xmonad preserves your old layout setting by default.
+--
+-- The available layouts. Note that each layout is separated by |||,
+-- which denotes layout choice.
+--
+myLayout = spacingRaw True (Border 0 10 10 10) True (Border 10 10 10 10) True \$
+  tiled ||| Mirror tiled ||| Full
+    where
+        -- default tiling algorithm partitions the screen into two panes
+        tiled = Tall nmaster delta ratio
+
+        -- The default number of windows in the master pane
+        nmaster = 1
+
+        -- The default proportion of screen occupied by master pane
+        ratio = 2/3
+
+        -- Percent of screen to increment by when resizing panes
+        delta = 3/100
+
+-------------------------------------------------------------------------------
+-- Window rules:
+
+-- Execute arbitrary actions and WindowSet manipulations when managing
+-- a new window. You can use this to, for example, always float a
+-- particular program, or have client always appear on a particular
+-- workspace.
+--
+-- To find the property name associated with a program, use
+-- > xprop | grep WM_CLASS
+-- and click on the client you're interested in.
+--
+-- To match on the WM_NAME, you can use 'title' in the same way that
+-- 'className' and 'resource' are used below.
+--
+myManageHook = composeAll
+    [ className =? "mpv"            --> doFloat
+    , className =? "feh"            --> doFloat
+    , className =? "Gimp"           --> doFloat
+    , className =? "Galculator"     --> doFloat
+    , className =? "Gmrun"          --> doFloat
+    , className =? "Inkscape"       --> doFloat
+    , className =? "oblogout"       --> doFloat
+    , resource  =? "desktop_window" --> doIgnore
+    , resource  =? "kdesktop"       --> doIgnore ]
+
+-------------------------------------------------------------------------------
+-- Event handling
+
+-- * EwmhDesktops users should change this to ewmhDesktopsEventHook
+--
+-- Defines a custom handler function for X events. The function should
+-- return (All True) if the default handler is to be run afterwards. To
+-- combine event hooks use mappend or mconcat from Data.Monoid.
+--
+myEventHook = mempty
+
+-------------------------------------------------------------------------------
+-- Status bars and logging
+
+-- Perform an arbitrary action on each internal status change or X event.
+-- See the 'XMonad.Hooks.DynamicLog' extension for examples.
+--
+myLogHook = return ()
+
+-------------------------------------------------------------------------------
+-- Startup hook
+
+-- Perform an arbitrary action each time xmonad starts or is restarted
+-- with mod-q. Used by e.g., XMonad.Layout.PerWorkspace to initialize
+-- per-workspace layout choices.
+--
+-- By default, do nothing.
+myStartupHook = return ()
+
+-- myStartupHook = do
+--    spawnOnce "lxsession"
+--    spawnOnce "picom -f"
+--    spawnOnce "nm-applet"
+--    spawnOnce "volumeicon"
+--    spawnOnce "nitrogen --restore &"
+
+---------------------------------------------------------------------------
+-- Command to launch the bar
+myBar = "xmobar"
+
+-- Custom PP, configure it as you like. It determines what is written
+-- to the bar.
+myPP = xmobarPP { ppCurrent = xmobarColor "#429942" "" . wrap "|" "|" }
+
+-- Key binding to toggle the gap for the bar.
+toggleStrutsKey XConfig {XMonad.modMask = modMask} = (modMask, xK_b)
+
+-------------------------------------------------------------------------
+-- Now run xmonad with all the defaults we set up.
+
+-- Run xmonad with the settings you specify. No Need to modify this.
+
+main = xmonad =<< statusBar myBar myPP toggleStrutsKey defaults
+
+-- A structure containing your configuration settings, overriding
+-- fields in the default config. Any you don't override, will
+-- use the defaults defined in xmonad/XMonad/Config.hs
+
+defaults = def
+    -- simple stuff
+    { terminal           = myTerminal
+    , modMask            = myModMask
+    , borderWidth        = myBorderWidth
+    , normalBorderColor  = myNormalBorderColor
+    , focusedBorderColor = myFocusedBorderColor
+    , focusFollowsMouse  = myFocusFollowsMouse
+    , clickJustFocuses   = myClickJustFocuses
+
+    -- key bindings
+    , keys               = myKeys
+    , mouseBindings      = myMouseBindings
+
+    -- hooks, layouts
+    , layoutHook         = myLayout
+    , manageHook         = myManageHook
+    , handleEventHook    = myEventHook
+    , logHook            = myLogHook
+    , startupHook        = myStartupHook
+    }
+
+-- | Finally, a copy of the default bindings in a simple textual format.
+help :: String
+help = unlines ["The default modifier key is 'alt'. Default keybindings:",
+    "",
+    "-- launching and killing programs",
+    "mod-Enter         Launch terminal",
+    "mod-p             Launch dmenu",
+    "mod-Shift-p       Launch gmrun",
+    "mod-Shift-c       Close/Kill the focused window",
+    "mod-Space         Rotate through the available layout algorithms",
+    "mod-Shift-space   Reset the layouts on the current workspace to default",
+    "mod-n             Resize/refresh viewed windows to the correct size",
+    "",
+    "-- move focus up or down the window stack",
+    "mod-Tab           Move focus to the next window",
+    "mod-Shift-Tab     Move focus to the previous window",
+    "mod-j             Move focus to the next window",
+    "mod-k             Move focus to the previous window",
+    "mod-m             Move focus to the master window",
+    "",
+    " -- modifying the window order",
+    "mod-Shift-Enter   Swap the focused window with the master window",
+    "mod-Shift-j       Swap the focused window with the next window",
+    "mod-Shift-k       Swap the focused window with the previous window",
+    "",
+    "-- resizing the master/slave ratio",
+    "mod-h             Shring the master area",
+    "mod-l             Expand the master area",
+    "",
+    "-- floating layout support",
+    "mod-t  Push window back into tiling; unfloat and re-tile it",
+    "",
+    "-- increase or decrease number of windows in the master area",
+    "mod-comma (mod-,)  Increment the number of windows in the master area",
+    "mod-period (mod-.) Deincrement the number of windows in the master area",
+    "",
+    "-- Quit, or restart",
+    "mod-Shift-q      Quit xmonad",
+    "mod-q            Restart xmonad",
+    "mod-[1..9]       Switch to workspace N",
+    "",
+    "-- Workspaces & screens",
+    "mod-Shift-[1..9]  Move client to workspace N",
+    "mod-{w,e,r}       Switch po physical/Xinerama screens 1, 2, or 3",
+    "mod-Shift-{w,e,r} Move client to screen 1, 2 or 3",
+    "",
+    "-- Mouse bindings: default actions bound to mouse events",
+    "mod-button1     Set the window to floating mode and move by dragging",
+    "mod-button2     Raise the window to the top of the stack",
+    "mod-button3     Set the window to floating mode and resize by dragging" ]
+EOF
+    [[ -d "/home/$USR/.config/xmobar" ]] || mkdir "/home/$USR/.config/xmobar"
+    [[ -s "/home/$USR/.config/xmobar/xmobarrc" ]] || cat > "/home/$USR/.config/xmobar/xmobarrc" <<- EOF
+Config {
+
+    -- appearance
+      font =        "xft:Bitstream Vera Sans Mono:pixelsize=13:bold:antialias=true"
+    , additionalFonts = [ "xft:FontAwesome:pixelsize=13" ]   -- <fn=1>
+        -- See character codes at https://fontawesome.com/cheatsheet
+    , bgColor =     "black"
+    , fgColor =     "#dddddd"
+    , position =    Top
+    , border =      BottomB
+    , borderColor = "#646464"
+    , alpha =       160         -- 0 = transparent, 255 = fully opaque
+
+    -- layout
+    , sepChar   = "%"   -- delineator between plugin names and straight text
+    , alignSep  = "}{"  -- separator between left-right alignment
+    -- Laptop with battery:
+    -- , template  = " %battery% | %multicpu% | %coretemp% | %memory% | %dynnetwork% }{ %EFHK% | %date% | %kbd% "
+    -- No battery:
+    , template  = " %StdinReader% | %multicpu% | %coretemp% | %memory% | %dynnetwork% }{ %EFHK% | %date% | %kbd% "
+
+    -- general behavior
+    , lowerOnStart =     True  -- send to bottom of window stack on start
+    , hideOnStart =      False -- start with window unmapped (hidden)
+    , allDesktops =      True  -- show on all desktops
+    , overrideRedirect = True  -- set Override Redirect flag (Xlib)
+    , pickBroadest =     False -- choose widest display (multi-monitor)
+    , persistent =       True  -- enable/disable hiding (True = disabled)
+
+    -- Plugins
+    --   Numbers can be automatically colored according to their value, xmobar
+    --   decides color based on a three-tier/two-cutoff system, controlled by
+    --   command options:
+    --      --Low sets the low cutoff
+    --      --High sets the high cutoff
+    --
+    --      --low sets the color below --Low cutoff
+    --      --normal sets the color between --Low and --High cutoffs
+    --      --High sets the color above --High cutoff
+    --
+    --   The --template option controls how the plugin is displayed. Text
+    --   color can be set by enclosing in <fc></fc> tags. For more details
+    --   see http://projects.haskell.org/xmobar/#system-monitor-plugins.
+    , commands =
+
+    -- weather monitor, note the ICAO airport code here and in the template earlier
+    [ Run Weather "EFHK"  [ "--template", "<skyCondition> | <fc=#4682B4><tempC></fc>°C | <fc=#4682B4><rh></fc>% | <fc=#4682B4><pressure></fc>hPa"
+                          ] 36000
+
+    -- StdinReader
+    , Run StdinReader
+
+    -- network activity monitor (dynamic interface resolution)
+    , Run DynNetwork      [ "--template", "<dev>: <tx>kB/s|<rx>kB/s"
+                          , "--Low"     , "1000"     -- units: B/s
+                          , "--High"    , "5000"     -- units: B/s
+                          , "--low"     , "darkgreen"
+                          , "--normal"  , "darkorange"
+                          , "--high"    , "darkred"
+                          ] 10
+
+    -- cpu activity monitor
+    , Run MultiCpu        [ "--template", "Cpu: <total0>%|<total1>%"
+                          , "--Low"     , "50"       -- units: %
+                          , "--High"    , "85"       -- units: %
+                          , "--low"     , "darkgreen"
+                          , "--normal"  , "darkorange"
+                          , "--high"    , "darkred"
+                          ] 10
+
+    -- cpu core temperature monitor
+    , Run CoreTemp        [ "--template", "Temp: <core0>°C|<core1>°C"
+                          , "--Low"     , "70"       -- units: °C
+                          , "--High"    , "90"       -- units: °C
+                          , "--low"     , "darkgreen"
+                          , "--normal"  , "darkorange"
+                          , "--high"    , "darkred"
+                          ] 50
+
+    -- memory usage monitor
+    , Run Memory          [ "--template" , "Mem: <usedratio>%"
+                          , "--Low"     , "20"       -- units: %
+                          , "--High"    , "90"       -- units: %
+                          , "--low"     , "darkgreen"
+                          , "--normal"  , "darkorange"
+                          , "--high"    , "darkred"
+                          ] 10
+
+    -- battery monitor
+    , Run Battery         [ "--template" , "Batt: <acstatus>"
+                          , "--Low"     , "20"       -- units: %
+                          , "--High"    , "90"       -- units: %
+                          , "--low"     , "darkgreen"
+                          , "--normal"  , "darkorange"
+                          , "--high"    , "darkred"
+                          , "--" -- battery specific options
+                                 -- discharging status
+                                 , "-o" , "<left>% (<timeleft>)"
+                                 -- AC "on" status
+                                 , "-O" , "<fc=#dAA520>Charging</fc>"
+                                 -- charged status
+                                 , "-i" , "<fc=006000>Charged</fc>"
+                          ] 50
+
+    -- time and date indicator
+    --  (%F = y-m-d date, %a = day of week, %T = h:m:s time)
+    , Run Date            "<fc=#ABABAB>%a %d.%m. %T</fc>" "date" 10
+
+    -- keyboard layout indicator
+    , Run Kbd             [ ("fi" , "<fc=#1A8FFF>FI</fc>")
+                          , ("us" , "<fc=#14FFFF>US</fc>")
+                          ]
+
+    ]
+
+  }
+EOF
+    [[ -d "/home/$USR/.config/picom" ]] || mkdir "/home/$USR/.config/picom"
+    [[ -s "/home/$USR/.config/picom/picom.conf" ]] || cp /etc/xdg/picom.conf* "/home/$USR/.config/picom/picom.conf"
+    sed -Ei 's/^(shadow-radius) =.*/\1 = 12;/' "/home/$USR/.config/picom/picom.conf"
+    if systemd-detect-virt -q; then
+        sed -Ei 's/^(vsync) ?=.*/\1 = false/' "/home/$USR/.config/picom/picom.conf"
+        # If lightdm or sddm is not used, probably need to set display resolution using xrandr
+        if ! systemctl is-enabled -q lightdm; then
+            touch "/home/$USR/.xprofile"
+            grep -qG '^xrandr --output ' "/home/$USR/.xprofile" || echo "xrandr --output $(xrandr -q|awk 'NR<6 && $2=="connected" {d=$1} END {print d?d:"Virtual-1"}') --mode ${VIRT_RESOLUTION:-1920x1080}" >> "/home/$USR/.xprofile"
+        fi
+    fi
+    touch "/home/$USR/.xprofile"
+    set_xkeymap
+    install_nitrogen
+    install_rofi -xmonad
+    install_aur_pkg -q oblogout-py3-git
+    grep -qG '^picom ' "/home/$USR/.xprofile" || echo "picom -f &" >> "/home/$USR/.xprofile"
+    if systemctl is-enabled -q display-manager &>/dev/null; then
+        log "XMonad configuration file is $xm\nPlease, reboot to start XMonad."
+    else
+        install_display-manager "Xmonad"
+    fi
+    [[ -d /etc/pacman.d/hooks ]] || sudo install -dm755 /etc/pacman.d/hooks
+    echo \
+"[Trigger]
+Operation = Upgrade
+Type = Package
+Target = haskell*
+
+[Action]
+Description = Recompiling Xmonad now because of Haskell updates ...
+When = PostTransaction
+Depends = xmonad
+Exec = /bin/sh -c \"runuser -l \$(who | cut -d' ' -f1 | uniq) -c 'xmonad --recompile'\"
+" | sudo tee /etc/pacman.d/hooks/recompile-xmonad.hook >/dev/null
+
+}
+
+# Wayland wm's Sway and Hyprland do not source /etc/profile, when GDM is the display manager.
+# This start-up script fixes that. The wm will also become the default session in GDM.
+wayland-gdm-startup() {
+    local wm f
+    while [[ $1 ]]; do
+        case "$1" in
+         sway) wm="sway";;
+         hyprland|Hyprland) wm="Hyprland";;
+         *) wm="";;
+        esac
+        shift
+    done
+    [[ $wm ]] || return
+
+    f="/usr/local/bin/${wm}-in-shell"
+    if [[ ! -e "$f" ]]; then
+        echo '#!'"/bin/bash" | sudo tee "$f" >/dev/null
+        echo "
+if [[ \$XDG_SESSION_TYPE = \"wayland\" ]] &&
+   [[ \$XDG_SESSION_CLASS != \"greeter\" ]] &&
+   [[ -n \$SHELL ]] &&
+   grep -q \"\$SHELL\" /etc/shells &&
+   ! grep -q \"false\" <<<\"\$SHELL\" &&
+   ! grep -q \"nologin\" <<<\"\$SHELL\"; then
+  if [[ \$1 != \"-l\" ]]; then
+    exec bash -c \"exec -l '\$SHELL' -c '\$0 -l \$*'\"
+  else
+    shift
+  fi
+fi
+
+exec /usr/bin/$wm \"\$@\"" | sudo tee -a "$f" >/dev/null
+        sudo chmod +x "$f"
+        sed "s,^Exec=.*,Exec=$f," "/usr/share/wayland-sessions/${wm,}.desktop" | sudo tee "/usr/share/wayland-sessions/${wm,}-in-shell.desktop" >/dev/null
+        sudo sed -i "/^Name=/s/=.*/=$wm in shell/" "/usr/share/wayland-sessions/${wm,}-in-shell.desktop"
+        sudo pacman -S --noconfirm --needed accountsservice
+        [[ -d /etc/accountsservice ]] || sudo mkdir /etc/accountsservice
+        [[ -d /etc/accountsservice/user-templates ]] || sudo cp -r /usr/share/accountsservice/user-templates /etc/accountsservice/
+        # re-using f
+        for f in /etc/accountsservice/user-templates/*; do
+            sudo sed -i "/^Session=/s/=.*/=${wm,}-in-shell/" "$f"
+        done
+        f="/var/lib/AccountsService/users/$USR"
+        sudo test -e "$f" && sudo sed -i "/^Session=/s/=.*/=${wm,}-in-shell/" "$f"
+    fi
+}
+
+install_sway() {
+    install_alacritty
+    sudo pacman -Sq --noconfirm --needed sway swaylock swayidle waybar dmenu pcmanfm xorg-xwayland qt5ct xdg-desktop-portal-wlr
+    #lsblk | grep -qw crypt && install_autologin sway
+    local confd="${XDG_CONFIG_HOME:-/home/$USR/.config}/sway"
+    [[ -d "$confd" ]] || mkdir -p "$confd"
+    [[ -s "$confd/config" ]] || cp /etc/sway/config "$confd"/
+    grep -qF "xkb_layout $KEYMAP" "$confd/config" || echo -e "\ninput type:keyboard {\n    xkb_layout $KEYMAP\n}" >> "$confd/config"
+    grep -qF 'bindsym $mod+x ' "$confd/config" || echo -e "\nbindsym \$mod+x exec swaylock -c 220000" >> "$confd/config"
+    [[ -d "$HOME/.config/waybar" ]] || mkdir "$HOME/.config/waybar"
+    [[ -e "$HOME/.config/waybar/config" ]] || cp /etc/xdg/waybar/{config,style.css} "$HOME/.config/waybar/"
+    install_aur_pkg -q nwg-look-bin
+    # Nitrogen does NOT work in wayland
+    sudo pacman -Sq --noconfirm --needed archlinux-wallpaper
+    local desktop_image=/usr/share/backgrounds/archlinux/conference.png
+    grep -qE '^output "?\*"? bg ' "$confd/config" || echo -e "\noutput \"*\" bg $desktop_image fill" >> "$confd/config"
+
+    systemd-detect-virt -q && sed -Ei "s/^#\s+(output) HDMI-A-1 (resolution) .*(position) .*/\1 Virtual-1 \2 $VIRT_RESOLUTION \3 ${VIRT_RESOLUTION%x*}.0/" "$confd/config"
+    
+    # undo gnome "fix" for wayland 
+    [[ -e ~/.config/kitty/kitty.conf ]] && sed -i '/^\s*linux_display_server x11/s/^/# /' ~/.config/kitty/kitty.conf
+    
+    # display manager: sddm, gdm or ly, NOT lightdm
+    pacman -Q sddm &>/dev/null || pacman -Q gdm &>/dev/null || install_gdm
+    if [[ -e /etc/gdm/custom.conf ]]; then
+        wayland-gdm-startup sway
+        grep -Eq "^#?AutomaticLoginEnable=" /etc/gdm/custom.conf ||
+          sudo sed -i '/\[daemon\]/,/^$/s/^$/#AutomaticLogin=\n#AutomaticLoginEnable=false\n&/' /etc/gdm/custom.conf
+        sudo systemctl enable -f gdm
+    else
+        sudo systemctl enable -f sddm
+    fi
+    log "Sway configuration file is ~/.config/sway/config\n  See also: https://wiki.archlinux.org/title/Sway" "Please, reboot to start Sway."
+}
+
+install_hyprland() {
+    local f m p term filemanager
+    if lspci | grep -Eqi '(vga|3d).*nvidia'; then
+        install_aur_pkg -q hyprland-nvidia
+    else
+        echo -e "Select which version of hyprland to install\n"
+        select _ in "hyprland" "hyprland-git (AUR)"; do
+            case "$REPLY" in
+            1) sudo pacman -S --noconfirm --needed hyprland; break;;
+            2) install_aur_pkg -q hyprland-git; break;;
+            *) echo "Select either 1 or 2";;
+            esac
+        done
+    fi
+    for p in xdg-desktop-portal-kde xde-desktop-portal-gnome xdg-desktop-portal-lxqt xdg-desktop-portal-wlr; do
+        pacman -Q "$p" &>/dev/null && if [[ $p == *kde ]]; then sudo pacman -Rnsdd --noconfirm "$p"; else sudo pacman -R --noconfirm "$p"; fi
+    done
+    sudo pacman -Sq --noconfirm --needed xdg-desktop-portal-hyprland qt5-wayland qt6-wayland qt5ct xorg-xwayland polkit-kde-agent hyprpaper dunst wl-clipboard wofi waybar dolphin otf-font-awesome gnome-text-editor arc-gtk-theme papirus-icon-theme
+    # wleave-git wants pgp key(s), which isn't nice when running in a script
+    install_aur_pkg -q nwg-look-bin --mflags --skippgpcheck wleave-git
+
+    # edit ~/.config/hypr/hyprland.conf
+    f="$HOME/.config/hypr/hyprland.conf"
+    [[ -d "$(dirname "$f")" ]] || mkdir "$(dirname "$f")"
+    if [[ ! -e "$f" ]]; then
+        cp /usr/share/hyprland/hyprland.conf "$f"
+        term="kitty" # Default with Hyprland
+        [[ ! -e /usr/bin/kitty ]] && [[ -e /usr/bin/alacritty ]] && term="alacritty"
+        [[ ! -e /usr/bin/kitty ]] && [[ ! -e /usr/bin/alacritty ]] && install_kitty
+        grep -q "\$terminal = $term" "$f" || sed -i "/\$terminal =/s/=/= $term #/" "$f"
+        [[ -e ~/.config/kitty/kitty.conf ]] && sed -i '/^\s*background_opacity /s/^/#/' ~/.config/kitty/kitty.conf
+        # undo gnome "fix" for kitty
+        [[ $term == kitty ]] && sed -i '/^# exec-once/a exec-once = kitty-fix' "$f"
+        [[ -e ~/.config/autostart/apparmor-notify.desktop ]] && sed -i "/^# exec-once/a exec-once = $(grep '^Exec=aa-notify' ~/.config/autostart/apparmor-notify.desktop | cut -d= -f2)" "$f"
+        sed -i '/^# exec-once/a exec-once = wl-clipboard-history -t' "$f"
+        sed -i '/^# exec-once/a exec-once = hyprpaper & dunst & waybar' "$f"
+        sed -i '/^# exec-once/a exec-once = dbus-update-activation-environment --systemd --all' "$f"
+        sed -i '/^# exec-once/a exec-once = /usr/lib/polkit-kde-authentication-agent-1' "$f"
+        sed -i "/kb_layout =/s/=.*/= $KEYMAP/" "$f"
+        sed -i '/\$mainMod = SUPER/a $shiftMod = SUPER_SHIFT\n$altMod = SUPERALT' "$f"
+        sed -i 's/mainMod, Q,/mainMod, Return,/' "$f" # exec, terminal
+        sed -i 's/mainMod, E,/mainMod, Space,/' "$f" # exec, filemanager
+        sed -i 's/mainMod, M,/mainMod SHIFT, Q,/' "$f" # exit
+        if [[ -e /usr/bin/wleave ]]; then
+            sed -i '/mainMod SHIFT, Q,/s/^/#/' "$f"
+            sed -i '/mainMod SHIFT, Q,/a bind = $shiftMod, Q, exec, wleave -p layer-shell' "$f"
+        else
+            sed -i '/mainMod SHIFT, Q,/a #bind = $shiftMod, Q, exec, wleave -p layer-shell' "$f" # adding this, but commented out
+            log "Hint: Install wleave-git from the AUR, and uncomment the wleave line in hyprland.conf"
+        fi
+        sed -i '/^input {/,/^$/s/^$/    repeat_delay = 600\n    repeat_rate = 25\n    numlock_by_default = true\n&/' "$f"
+        sed -i '/^\s*kb_options =/s/=.*/= caps:swapescape # for vim/' "$f" 
+        #sed -i '/^\s*follow_mouse =/= /= 0 # /' "$f"
+        sed -i '/^\s*rounding =/s/= /= 5 # /' "$f"
+        sed -i '/^\s*gaps_in =/s/= /= 2 # /' "$f"
+        sed -i '/^\s*gaps_out =/s/= /= 5 # /' "$f"
+        sed -i '/^\s*border_size =/s/= /= 3 # /' "$f"
+        systemd-detect-virt -q && sed -i "/monitor=/s/=.*/=Virtual-1,$VIRT_RESOLUTION,0x0,1/" "$f"
+        
+        # Default filemanager is dolphin (from KDE/Plasma)
+        # Unless KDE/Plasma is also installed, dolphin is not very nice, so choose nemo
+        [[ -e /usr/share/wayland-sessions/plasmawayland.desktop ]] || filemanager="nemo"
+        
+        # If you want nemo or thunar, set filemanager to either "nemo" or "thunar"
+        filemanager="nemo"
+        
+        if ! grep -q "fileManager = ${filemanager:-dolphin}" "$f"; then
+            case "$filemanager" in
+                nemo)
+                    sudo pacman -S --noconfirm --needed nemo
+                    gsettings set org.cinnamon.desktop.default-applications.terminal exec "$term"
+                    ;;
+                thunar) 
+                    sudo pacman -S --noconfirm --needed thunar
+                    ;;
+            esac
+            sed -i "/fileManager =/s/=.*/= $filemanager/" "$f"
+            log "Hint: Select GTK theme with \"GTK Settings\" i.e. nwg-look."
+        fi
+
+        # windowrules v1, these will float
+        for t in pavucontrol blueman-manager nm-connection-editor $filemanager; do
+            sed -i "/# Example windowrule v1/,/^$/s/^$/windowrule = float, ^($t)$\n&/" "$f"
+        done
+        # and these too
+        sed -i '/# Example windowrule v1/,/^$/s/^$/windowrule = float, title:^(btop)$\n&/' "$f"
+        sed -i '/# Example windowrule v1/,/^$/s/^$/windowrule = float, title:^(SnapperGUI)$\n&/' "$f"
+
+        # windowrule v2, opacity etc.
+        for t in $term $filemanager; do
+            sed -i "/# Example windowrule v2/,/^$/s/^$/windowrulev2 = opacity 0.85 0.85,class:^($t)$\n&/" "$f"
+        done
+        sed -i '/# Example windowrule v2/,/^$/s/^$/windowrulev2 = opacity 0.85 0.85,title:(.*)(Code - OSS)$\n&/'
+        sed -i "/# Example windowrule v2/,/^$/s/^$/windowrulev2 = animation popin,class:^($filemanager)$\n&/" "$f"
+        sed -i '/# Example windowrule v2/,/^$/s/^$/windowrulev2 = move cursor -3% -105%,class:^(wofi)$\n&/' "$f"
+        sed -i '/# Example windowrule v2/,/^$/s/^$/windowrulev2 = noanim,class:^(wofi)$\n&/' "$f"
+
+        # This tames the mouse in QEMU/libvirt when 3D acceleration is enabled
+        [[ $(systemd-detect-virt) == kvm ]] && sed -i '/# Example windowrule v1/i device:qemu-qemu-usb-tablet {\n    sensitivity = -0.5\n}\n' "$f"
+    fi
+
+    # when 3D acceleration is on in virt-manager, this must be added to get a "usable" mouse
+    systemd-detect-virt -q && sudo dmesg | grep -q virgl && ! grep -q '^env = WLR_NO_HARDWARE_CURSORS' "$f" &&
+      sed -i '/^env =/,/^$/s/^$/env = WLR_NO_HARDWARE_CURSORS,1\n&/' "$f"
+
+    # waybar
+    f="$HOME/.config/waybar/config"
+    if [[ ! -e "$f" ]]; then
+        [[ -d "$(dirname "$f")" ]] || mkdir "$(dirname "$f")"
+        [[ -e "$f" ]] || cp /etc/xdg/waybar/* "$(dirname "$f")/"     
+        # enable "hyprland/window" in the center
+        sed -i '/"modules-center":/s/sway/hyprland/' "$f"
+        # enable and uncomment workspaces
+        sed -i 's,sway/workspaces,hyprland/workspaces,g' "$f"
+        m=$(mktemp /tmp/XXXX)
+        awk '/"hyprland\/workspaces":/ {f=1} f && $1=="//" {sub(/\/\/ /,"")} $1~/},/ {f=0} 1' "$f" > "$m" && cp "$m" "$f" && rm "$m"
+        # font-size 14px in waybar (could be even bigger)
+        sed -i '/font-size:/s/:.*/: 14px;/' "$(dirname "$f")"/style.css
+    fi
+    # pacman updates module for waybar
+    install_aur_pkg -q waybar-module-pacman-updates-git
+    if ! grep '"custom/updates"' "$f"; then
+        m="\"custom/updates\": {\n        \"format\": \"{} {icon}\",\n        \"return-type\": \"json\",\n        \"format-icons\": {\n            \"has-updates\": \"󱍷 \",\n            \"updated\": \"󰂪\"\n        },\n        \"exec-if\": \"which waybar-module-pacman-updates\",\n        \"exec\": \"waybar-module-pacman-updates\"\n    }"
+        sed -i "/^}/i $m" "$f" && sed -zi 's/}\n"/},\n    "/' "$f"
+        # Show it on the right before "clock" 
+        sed -i '/"modules-right":/s|"clock"|"custom/updates", &|' "$f"
+    fi
+
+    # enable display/login manager (sddm or gdm)
+    which sddm &>/dev/null || which gdm &>/dev/null || install_gdm
+    if [[ -e /etc/gdm/custom.conf ]]; then
+        wayland-gdm-startup hyprland
+        grep -Eq "^#?AutomaticLoginEnable=" /etc/gdm/custom.conf ||
+          sudo sed -i '/\[daemon\]/,/^$/s/^$/#AutomaticLogin=\n#AutomaticLoginEnable=false\n&/' /etc/gdm/custom.conf
+        sudo systemctl enable -f gdm
+    else
+        sudo systemctl enable -f sddm
+    fi
+
+    log "Hyprland configuration is at ~/.config/hypr/hyprland.conf" \
+        "Please, reboot to start Hyprland."
+}
+
+install_DTOS() {
+    local d
+    grep -qxF '[dtos-core-repo]' /etc/pacman.conf && return 1
+    git clone https://gitlab.com/dtos/dtos.git /tmp/dtos
+    [[ $LC_CTYPE ]] || { export LC_CTYPE="$LANG"; echo "LC_CTYPE=$LANG" >> /etc/locale.conf; sudo locale-gen; }
+    pushd /tmp/dtos && /tmp/dtos/dtos; popd || return
+    #sed -Ei 's/^(use_imv)=1/\1=0/' ~/.config/dmscripts/config
+    [ -s ~/.config/user-dirs.dirs ] && d="$(grep '^XDG_DOWNLOAD_DIR' "$HOME/.config/user-dirs.dirs" | cut -d= -f2 | tr -d \")"
+    [[ $d ]] && sed -Ei 's|^(c.downloads.location.directory) =.*|\1 = '\'"${d/\$HOME/\~}"\''|' "$HOME/.config/qutebrowser/config.py"
+    if systemd-detect-virt -q; then
+        touch "$HOME/.xprofile"
+        grep -qG '^xrandr --output ' "$HOME/.xprofile" || echo "xrandr --output $(xrandr -q|awk 'NR<6 && $2=="connected" {d=$1} END {print d?d:"Virtual-1"}') --mode ${VIRT_RESOLUTION:-1920x1080}" >> "$HOME/.xprofile"
+    fi
+    log "Please, reboot to start DTOS."
+}
+
+install_snapper() {
+    local f n i hm tmpf conf=/etc/snapper/configs
+    if [[ $(mount | awk '$3=="/" {print $5}') == btrfs ]] && ! command -v snapper &>/dev/null && ! command -v timeshift &>/dev/null && ! command -v yabsnap &>/dev/null; then
+        sudo pacman -Sq --noconfirm --needed snapper
+
+        # Converting the system to use the btrfs default subvolume property, which snapper uses
+        sudo btrfs subvol set-default "$(sudo btrfs inspect-internal rootid /)" /
+        i=0
+        for f in /etc/cmdline.d/root.conf /etc/kernel/cmdline /etc/kernel/fallback_cmdline /etc/default/grub "$EFI"/loader/entries/arch.conf "$EFI"/EFI/refind/refind.conf "$EFI"/archlinux.nsh; do
+            [[ -e "$f" ]] && grep -q '^[^#].* rootfstype=btrfs rootflags=subvol=@' "$f" &&\
+              sudo sed -i 's/ rootfstype=btrfs rootflags=subvol=@//' "$f" && [[ $f == *cmdline* ]] && ((i++))
+            [[ $f == /boot/archlinux.nsh ]] && [[ -e "$f" ]] && log "Verify boot options saved with efibootmgr,\n  remove these options: 'rootfstype=btrfs rootflags=subvol=@'\n  and save the new boot configuration with efibootmgr."
+        done
+        ((i > 0)) && sudo mkinitcpio -P
+
+        # Snapper will create a /.snapshots subvolume, but we want to use our own /@snapshots subvolume
+        findmnt -nt btrfs | grep -q '[^a-z]/\.snapshots\s' && sudo umount /.snapshots
+        [[ -d /.snapshots ]] && sudo rm -r /.snapshots
+        sudo snapper -c root create-config /
+        # Delete the new /.snapshots subvolume, which snapper created:
+        sudo btrfs subvolume delete /.snapshots
+        # Subvolume for /.snapshots is declared in /etc/fstab, so we can re-mount:
+        [[ -d /.snapshots ]] || sudo mkdir /.snapshots
+        sudo mount -av
+        sudo chmod 750 /.snapshots
+        sudo chown -R :wheel /.snapshots
+
+        # home snapshots:
+        hm=""
+        mount | grep -q '\s/home/\.snapshots\s' && hm=yes && sudo umount /home/.snapshots
+        [[ -d /home/.snapshots ]] && sudo rm -r /home/.snapshots
+        sudo snapper -c home create-config /home
+        if [[ $hm ]]; then
+            # If /home/.snapshots was mounted, delete snapper's new /home/.snapshot and re-mount
+            sudo btrfs subvolume delete /home/.snapshots
+            [[ -d /home/.snapshots ]] || sudo mkdir /home/.snapshots
+            sudo mount -a
+        fi
+        sudo chmod 750 /home/.snapshots
+        sudo chown -R :wheel /home/.snapshots
+
+        [[ -e $conf/home ]] || log "ERROR! Snapper install: No /home config found."
+        tmpf="$(mktemp /tmp/XXXX)"
+
+        # These are done "just in case..."
+        sudo cp -af "$conf/home" "$tmpf"
+        sudo sed -i 's/"home"/"root home"/' /etc/conf.d/snapper
+
+        # configuring snapshots for /
+        [[ -e "$conf/root" ]] && sudo cp -af "$conf/root" "$tmpf"
+        sudo sed -i '/^SUBVOLUME/s,=.*,="/",' "$tmpf"
+        sudo sed -i '/^ALLOW_GROUPS/s/=.*/="wheel"/' "$tmpf"
+        sudo sed -i '/^SYNC_ACL/=.*/="yes"/' "$tmpf"
+        sudo sed -i '/^NUMBER_LIMIT/s/=.*/="24"/' "$tmpf"
+        sudo sed -i '/^NUMBER_LIMIT_IMPORTANT/s/=.*/="10"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_CREATE/s/=.*/="no"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_HOURLY/s/=.*/="0"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_DAILY/s/=.*/="7"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_WEEKLY/s/=.*/="0"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_MONTHLY/s/=.*/="0"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_YEARLY/s/=.*/="0"/' "$tmpf"
+        sudo cp -af "$tmpf" "$conf/root"
+
+        # configuring snapshots for /home
+        [[ -e "$conf/home" ]] && sudo cp -af "$conf/home" "$tmpf"
+        sudo sed -i '/^SUBVOLUME/s,=.*,="/home",' "$tmpf"
+        sudo sed -i '/^ALLOW_GROUPS/s/=.*/="wheel"/' "$tmpf"
+        sudo sed -i '/^SYNC_ACL/=.*/="yes"/' "$tmpf"
+        sudo sed -i '/^NUMBER_LIMIT/s/=.*/="20"/' "$tmpf"
+        sudo sed -i '/^NUMBER_LIMIT_IMPORTANT/s/=.*/="10"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_CREATE/s/=.*/="yes"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_HOURLY/s/=.*/="6"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_DAILY/s/=.*/="7"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_WEEKLY/s/=.*/="0"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_MONTHLY/s/=.*/="0"/' "$tmpf"
+        sudo sed -i '/^TIMELINE_LIMIT_YEARLY/s/=.*/="0"/' "$tmpf"
+        sudo cp -af "$tmpf" "$conf/home" && sudo rm "$tmpf"
+
+        if [[ ! -d /etc/systemd/system/snapper-cleanup.timer.d ]]; then
+            sudo mkdir /etc/systemd/system/snapper-cleanup.timer.d
+            echo -e "[Timer]\nOnBootSec=35s\nOnUnitActiveSec=3h" | sudo tee /etc/systemd/system/snapper-cleanup.timer.d/override.conf >/dev/null
+        fi
+        sudo pacman -Sq --noconfirm --needed snap-pac
+        sudo systemctl enable snapper-timeline.timer snapper-cleanup.timer
+        sudo systemctl disable snapper-boot.timer # enable if you want root snapshot on every boot
+        install_aur_pkg -q snapper-gui-git btrfs-assistant
+        pacman -Q snapper-gui &>/dev/null || paru --noconfirm --skipreview snapper-gui
+        # To get dark theme with btrfs-assistant, qt5ct is needed to set the QT theme (for root)
+        for f in "$HOME"/.config/qt5ct "$HOME"/.config/qt6ct; do
+            n="$(basename "$f")"
+            [[ -d "$f" ]] || mkdir -p "$f"
+            touch "$f"/"$n".conf             
+            sudo test -d /root/.config/"$n" || sudo mkdir -p /root/.config/"$n"
+            sudo test -e /root/.config/"$n"/"$n".conf || sudo ln -s "$f"/"$n".conf /root/.config/"$n"/"$n".conf
+        done
+        if pacman -Q grub-btrfs &>/dev/null && [[ -e /boot/grub/grub.cfg ]]; then
+            sudo grub-mkconfig -o /boot/grub/grub.cfg
+            sudo systemctl enable --now grub-btrfsd
+        fi
+
+        log "Snapper is installed, and it will be taking BTRFS snapshots after next boot."
+    fi
+}
+
+# Yabsnap is an alternative to snapper.
+install_yabsnap() {
+    local tmpf conf=/etc/yabsnap/configs
+
+    pacman -Q yabsnap &>/dev/null && return 1
+    pacman -Q snapper &>/dev/null && return 1
+    [[ $(findmnt -no FSTYPE /.snapshots) == "btrfs" ]] || return 1
+
+    install_aur_pkg -q yabsnap
+    tmpf="$(mktemp /tmp/XXXX)"
+
+    sudo yabsnap create-config root
+    sudo cp -af "$conf/root.conf" "$tmpf"
+    sudo sed -i '/source =/s,=.*,= /,' "$tmpf"
+    sudo sed -i '/keep_daily =/s/=.*/= 0/' "$tmpf"
+    sudo sed -i '/keep_preinstall =/s/=.*/= 20/' "$tmpf"
+    sudo cp -af "$tmpf" "$conf/root.conf"
+
+    sudo yabsnap create-config home
+    sudo cp -af "$conf/home.conf" "$tmpf"
+    sudo sed -i '/source =/s,=.*,= /home,' "$tmpf"
+    sudo sed -i '/keep_hourly =/s/=.*/= 3/' "$tmpf"
+    sudo sed -i '/keep_daily =/s/=.*/= 7/' "$tmpf"
+    sudo sed -i '/keep_preinstall =/s/=.*/= 0/' "$tmpf"
+    sudo cp -af "$tmpf" "$conf/home.conf"
+
+    sudo rm "$tmpf"
+    sudo chmod 750 /.snapshots
+    sudo chown -R :wheel /.snapshots
+    sudo systemctl enable --now yabsnap.timer
+    [[ -f /boot/grub/grub.cfg ]] && sudo systemctl enable --now grub-btrfsd
+    log "Yabsnap is installed and running."
+}
+
+install_laptop() {
+    lspci | grep -qiF nvidia || return 1
+
+    # https://wiki.archlinux.org/index.php/Acpid
+    sudo pacman -Sq --noconfirm --needed dkms acpi acpi_call-dkms acpid && sudo systemctl enable acpid
+
+    # If your laptop has a hybrid Nvidia display adapter:
+    echo -e "\nSelect which Nvidia Hybrid manager to install:"
+    select REPLY in envycontrol optimus-manager system76-power; do break; done
+    case "$REPLY" in
+      envycontrol)
+          install_aur_pkg -q envycontrol
+          log "To use envycontrol, run: sudo envycontrol --swith <MODE>\nSee documentation: https://github.com/geminis3/envycontrol"
+          ;;
+      optimus-manager)
+          install_aur-pkg -q optimus-manager
+          if [[ $desktop == plasma ]] || [[ $desktop == lxqt ]]; then
+              install_aur_pkg -q optimus-manager-qt
+              sudo sed -Ei 's/[^#]\s*(DisplayCommand|DisplayStopCommand)/#\1/' /etc/sddm.conf.d/general.conf
+              [[ -e /etc/sddm.conf ]] && sudo sed -Ei 's/[^#]\s*(DisplayCommand|DisplayStopCommand)/#\1/' /etc/sddm.conf
+          fi
+          log "See optimus-manager configuration on github: https://github.com/Askannz/optimus-manager"
+          ;;
+      system76-power)
+          install_aur_pkg -q system76-power && sudo systemctl enable --now system76-power
+          [[ $desktop == gnome ]] && install_aur_pkg -q gnome-shell-extension-system76-power-git
+          log "To use sytem76-power, run e.g:\n   sudo system76-power graphics integrated\nPossible graphics choices: integrated, hybrid, nvidia, compute" \
+              "If Intel + Nvidia laptop doesn't start in graphics mode,\n   add ${W}i915${NC} and ${W}nvidia${NC} into MODULES in /etc/mkinitcpio.conf"
+          ;;
+    esac
+
+    #If Intel laptop does not start in graphics mode, add 'i915' and 'nvidia' into /etc/mkinitcpio.conf MODULES:
+    #sudo sed -i '/MODULES=/s/(/(i915 nvidia /' /etc/mkinitcpio.conf && sudo mkinitcpio -P
+}
+
+# Mkmm is a Kernel Modules Manager in the AUR. An alternative to kernel-modules-hook.
+# Not in the menu of this script, but 'mkmm' can be added to the packages to install.
+install_mkmm() {
+    pacman -Q mkmm &>/dev/null && return 0
+    pacman -Qq kernel-modules-hook &>/dev/null && sudo systemctl disable --now linux-modules-cleanup && sudo pacman -Rns --noconfirm kernel-modules-hook
+    if ! pacman -Q mkmm &>/dev/null; then
+        pacman -Q paru &>/dev/null && paru -S --noconfirm mkmm
+        pacman -Q mkmm &>/dev/null || { pacman -Q yay &>/dev/null && yay -S --noconfirm mkmm; }
+    fi
+    pacman -Q mkmm &>/dev/null || return 1
+    [[ -d /etc/pacman.d/hooks ]] || sudo mkdir -p /etc/pacman.d/hooks
+    [[ -e /etc/pacman.d/hooks/10-mkmm-tmpfs-pre.hook ]] || sudo ln -s /usr/share/mkmm/10-mkmm-tmpfs-pre.hook /etc/pacman.d/hooks
+    [[ -e /etc/pacman.d/hooks/10-mkmm-tmpfs-post.hook ]] && sudo rm /etc/pacman.d/hooks/10-mkmm-tmpfs-post.hook
+    [[ -e /etc/pacman.d/hooks/65-mkmm-tmpfs-post.hook ]] || sudo ln -s /usr/share/mkmm/65-mkmm-tmpfs-post.hook /etc/pacman.d/hooks
+    sudo systemctl enable mkmm-bleach.service
+    log "Kernel Modules Manager mkmm is enabled."
+}
+
+# Print usage and current selections. With parameter -s print only current selection.
+usage() {
+    local have_aura have_paru have_yay have_pamac have_flatpak have_snapper have_yabsnap have_zsh have_vim have_kitty have_alacritty have_alacritty_fix have_vnc
+    local multilib_status hibernation_status gdm_status lightdm_status sddm_status cinnamon_status gnome_status xfce_status kde_status mate_status lxqt_status dwm_status qtile_status xmonad_status dtos_status
+
+    #local have_x11vnc laptop_status sway_status
+    #have_x11vnc=$(test -e /etc/systemd/system/vnc.service && echo -en "${G}✔${NC}" || echo -en " ")
+    #laptop_status=$(pacman -Q envycontrol &>/dev/null || pacman -Q system76-power &>/dev/null || pacman -Q optimus-manager &>/dev/null && echo -en "${G}✔${NC}" || echo -en " ")
+
+    have_aura=$(test -e /usr/bin/aura && echo -en "${G}✔${NC}" || echo -en " ")
+    have_paru=$(test -e /usr/bin/paru && echo -en "${G}✔${NC}" || echo -en " ")
+    have_yay=$(test -e /usr/bin/yay && echo -en "${G}✔${NC}" || echo -en " ")
+    have_pamac=$(test -e /usr/bin/pamac && echo -en "${G}✔${NC}" || echo -en " ")
+    have_flatpak=$(test -e /usr/bin/flatpak && echo -en "${G}✔${NC}" || echo -en " ")
+    have_snapper=$(test -e /usr/bin/snapper && echo -en "${G}✔${NC}" || echo -en " ")
+    have_yabsnap=$(test -e /usr/bin/yabsnap && echo -en "${G}✔${NC}" || echo -en " ")
+    have_zsh=$(test -d ~/.oh-my-zsh && echo -en "${G}✔${NC}" || echo -en " ")
+    have_vim=$(test -s ~/.config/nvim/init.vim && echo -en "${G}✔${NC}" || echo -en " ")
+    have_kitty=$(test -s ~/.config/kitty/kitty.conf && echo -en "${G}✔${NC}" || echo -en " ")
+    have_alacritty=$(test -s ~/.config/alacritty/alacritty.toml && echo -en "${G}✔${NC}" || echo -en " ")
+    have_alacritty_fix=$(grep -qs '^WINIT_X11_SCALE_FACTOR = "1"' "${XDG_CONFIG_HOME:-$HOME/.config}/alacritty/env.toml" && echo -en "${G}✔${NC}" || echo -en " ")
+    have_vnc=$(pacman -Q tigervnc &>/dev/null && echo -en "${G}✔${NC}" || echo -en " ")
+    have_postgres=$(pacman -Q postgresql &>/dev/null && echo -en "${G}✔${NC}" || echo -en " ")
+    #chaotic_status=$(grep -qxF '[chaotic-aur]' /etc/pacman.conf && echo -en "${G}✔${NC}" || echo -en "${R}✖${NC}")
+    multilib_status=$(grep -qxF '[multilib]' /etc/pacman.conf && echo -en "${G}✔${NC}" || echo -en "${R}✖${NC}")
+    hibernation_status=$(test -s /etc/polkit-1/rules.d/10-disable-hibernation.rules && echo -en "${R}✖${NC}" || echo -en "${G}✔${NC}")
+    lightdm_status=$(systemctl -q is-enabled lightdm && echo -en "${G}✔${NC}" || echo -en " ")
+    sddm_status=$(systemctl -q is-enabled sddm && echo -en "${G}✔${NC}" || echo -en " ")
+    gdm_status=$(systemctl -q is-enabled gdm && echo -en "${G}✔${NC}" || echo -en " ")
+    cinnamon_status=$(test -e /usr/share/xsessions/cinnamon.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    gnome_status=$(test -e /usr/share/wayland-sessions/gnome.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    xfce_status=$(test -e /usr/share/xsessions/xfce.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    kde_status=$(test -e /usr/share/wayland-sessions/plasmawayland.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    mate_status=$(test -e /usr/share/xsessions/mate.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    lxqt_status=$(test -e /usr/share/xsessions/lxqt.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    dwm_status=$(test -e /usr/share/xsessions/dwm.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    qtile_status=$(test -e /usr/share/xsessions/qtile.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    #sway_status=$(test -e /usr/share/wayland-sessions/sway.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    xmonad_status=$(test -e /usr/share/xsessions/xmonad.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    hyprland_status=$(test -e /usr/share/wayland-sessions/hyprland.desktop && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    dtos_status=$(test -e /usr/share/xsessions/xmonad.desktop && grep -qxF '[dtos-core-repo]' /etc/pacman.conf && echo -en "${G}✔${NC}" || echo -en "${R} ${NC}")
+    [[ $desktop ]] || desktop="$XDG_SESSION_DESKTOP"
+    [[ $desktop ]] || desktop="$DESKTOP_SESSION"
+    desktop=${desktop,,}
+    [[ $desktop == kde ]] && desktop=plasma
+    detect_autologin -q
+    {
+    [[ $1 != '-s' ]] && echo -e "\nUsage: ${G}$(basename "$0")${NC} [${W}item...${NC}]\nwhere [${W}item...${NC}] can be any space separated collection of the following items:"
+    echo -e "
+      Item              Description
+      -------------------------------------------------------------------------
+    $have_aura ${W}aura${NC}              : Aura AUR helper
+    $have_paru ${W}paru${NC}              : Paru AUR helper
+    $have_yay ${W}yay${NC}               : Yay AUR helper
+    $have_pamac ${W}pamac${NC}[${W}-all${NC}]       : Pamac software manager, optionally pamac-all
+    $have_flatpak ${W}flatpak${NC}           : Flatpak with flathub integration"
+
+    if [[ $(findmnt -no FSTYPE /) == "btrfs" ]]; then
+      echo
+      [[ $have_yabsnap == " " ]] && echo -e "    $have_snapper ${W}snapper${NC}           : Snapper BTRFS snapshot manager, with root and home set-ups"
+      [[ $have_snapper == " " ]] && echo -e "    $have_yabsnap ${W}yabsnap${NC}           : Yabsnap BTRFS snapshot manager, with root and home set-ups"
+    fi
+    echo -e "
+    $have_zsh ${W}zsh${NC}               : Install / Update zsh shell plugins
+    $have_vim ${W}vim${NC}               : Vim and Neovim with settings
+    $have_kitty ${W}kitty${NC}             : Kitty terminal with settings
+    $have_alacritty ${W}alacritty${NC}         : Alacritty terminal with settings
+    $have_alacritty_fix ${W}alacritty-fix${NC}     : Fix if alacritty font is too big (e.g. in VM's)
+    $have_postgres ${W}postgresql${NC}        : PostgreSQL database install/upgrade"
+    if ! pacman -Q samba &>/dev/null || [[ ! -s /etc/samba/smb.conf ]]; then
+        echo -e "      ${W}samba${NC}             : Samba with basic settings"
+    fi
+    if ! pacman -Q firefox &>/dev/null; then
+        echo -e "      ${W}firefox${NC}           : Firefox with localization"
+    fi
+    if ! pacman -Q brave &>/dev/null && ! pacman -Q brave-beta &>/dev/null; then
+        echo -e "      ${W}brave${NC}[${W}-beta${NC}]      : Brave browser, optionally beta version"
+    fi
+    if ! pacman -Q thunderbird &>/dev/null; then
+        echo -e "      ${W}thunderbird${NC}       : Thunderbird with localization"
+    fi
+    if ! pacman -Q libreoffice &>/dev/null; then
+        echo -e "      ${W}libreoffice${NC}       : Libre Office Fresh with localization"
+    fi
+
+    if ! pacman -Q steam &> /dev/null; then
+        echo -e "      ${W}steam${NC}             : Steam (for gaming)"
+    fi
+    echo -e "    $have_vnc ${W}tigervnc${NC}          : TigerVNC server with settings
+      ${W}laptop${NC}            : For laptops with Nvidia hybrid GPUs"
+    #[[ -s /etc/pacman.d/hooks/50-bootbackup.hook ]] || echo -e "      ${W}bootbackup${NC}        : Automated /boot backups"
+    [[ -d /home/$USR/.ssh ]] || echo -e "      ${W}ssh-key${NC}           : Generate a Ed25519 SSH Key for yourself"
+    if ! systemctl is-enabled -q systemd-homed; then
+        if [[ ${autologin%:*} ]]; then
+            desktop="${autologin%:*}"
+            echo -e "    ${G}✔${NC} ${W}autologin${NC}         : Autologin into ${desktop^}"
+        elif [[ $desktop ]]; then
+            echo -e "      ${W}autologin${NC}         : Autologin into ${desktop^}"
+        else
+            echo -e "      ${W}autologin${NC}         : Autologin - Desktop env. or Window Manager is needed"
+        fi
+    fi
+    echo -e "
+    $cinnamon_status ${W}cinnamon${NC}          : Cinnamon desktop environment
+    $gnome_status ${W}gnome${NC} [${W}full${NC}]      : Gnome desktop environment with GDM, opt. full
+    $kde_status ${W}kde${NC} [${W}full${NC}]        : KDE Plasma desktop environment with SDDM, opt. full
+    $mate_status ${W}mate${NC} [${W}full${NC}]       : MATE desktop environment, opt. full (i.e. mate-extra)
+    $xfce_status ${W}xfce${NC}              : Xfce desktop environment
+    $lxqt_status ${W}lxqt${NC}              : LXQt desktop environment
+    $dwm_status ${W}dwm${NC}               : Dwm window manager
+    $qtile_status ${W}qtile${NC}             : Qtile window manager
+    $hyprland_status ${W}hyprland${NC}          : Hyprland window manager
+    $xmonad_status ${W}xmonad${NC}            : XMonad window manager
+    $dtos_status ${W}DTOS${NC}              : DTOS by Derek Taylor of DistroTube fame
+
+    $gdm_status ${W}gdm${NC}               : GDM login manager for all desktops and window managers
+    $sddm_status ${W}sddm${NC}              : SDDM login manager for all desktops and window managers
+    $lightdm_status ${W}lightdm${NC} [${W}slick${NC}]   : LightDM login manager for all desktops, opt. Slick theme"
+    #$chaotic_status ${W}+c${NC}/${W}-c${NC}, ${W}enable${NC}/${W}disable chaotic${NC}     : Enable or disable Chaotic-aur
+    echo -e "
+    $multilib_status ${W}+m${NC}/${W}-m${NC}, ${W}enable${NC}/${W}disable multilib${NC}    : Enable or disable multilib (32 bit libs)
+    $hibernation_status ${W}+h${NC}/${W}-h${NC}, ${W}enable${NC}/${W}disable hibernation${NC} : Enable or disable hibernation"
+    [[ $hibernation_status == *"32m"* ]] && printf '%33s%s\n' "" "$(free -g|awk '/Mem:/ {ram=$2} /Swap:/ {swap=$2} END {if (ram-swap>0) print "Warning: Need at least " 1+ram-swap "G more swap space to hibernate."}')"
+    } | less -FR
+}
+
+main() {
+    if [[ -z $1 ]]; then
+        usage
+    else
+        [[ $* =~ dwm ]] && desktop=dwm
+        [[ $* =~ sway ]] && desktop=sway
+        [[ $* =~ qtile ]] && desktop=qtile
+        [[ $* =~ xmonad ]] && desktop=xmonad
+        [[ $* =~ gnome ]] && desktop=gnome
+        [[ $* =~ cinnamon ]] && desktop=cinnamon
+        [[ $* =~ kde ]] && desktop=plasma
+        [[ $* =~ plasma ]] && desktop=plasma
+        [[ $* =~ xfce ]] && desktop=xfce
+        [[ $* =~ lxqt ]] && desktop=lxqt
+        [[ $* =~ samba ]] && SAMBA=1
+        [[ $* =~ DTOS ]] && desktop=xmonad
+        [[ $desktop ]] || desktop="$XDG_SESSION_DESKTOP"
+        [[ $desktop ]] || desktop="$DESKTOP_SESSION"
+        desktop="${desktop,,}"
+        [[ $desktop == kde ]] && desktop=plasma
+
+        while [[ $1 ]]; do
+            if [[ $1 == enable ]] || [[ $1 == disable ]]; then
+              item="$2"
+            else
+              item="$1"
+            fi
+            case "$item" in
+                multilib|hibernation) # |chaotic
+                    if [[ $# -ge 2 ]]; then
+                       "${1}_${2}" || { usage; break; }
+                       shift
+                    else
+                       usage
+                       break
+                    fi
+                    shift
+                    ;;
+                +c|+m|+h|-c|-m|-h)
+                    [[ $item == '+c' ]] && enable_chaotic
+                    [[ $item == '+m' ]] && enable_multilib
+                    [[ $item == '+h' ]] && enable_hibernation
+                    [[ $item == '-c' ]] && disable_chaotic
+                    [[ $item == '-m' ]] && disable_multilib
+                    [[ $item == '-h' ]] && disable_hibernation
+                    shift
+                    ;;
+                cinnamon|xfce|lxqt|dwm|qtile|xmonad|DTOS|gdm|sddm|yay|paru|aura|flatpak|samba|steam|fonts|alacritty|alacritty-fix|tigervnc|kitty|firefox|thunderbird|libreoffice|snapper|bootbackup|laptop|vim|yabsnap)
+                    "install_$item"
+                    shift
+                    ;;
+                mkmm|postgresql|helix)
+                    "install_$item"
+                    shift
+                    ;;
+                hyprland|sway)
+                    if systemd-detect-virt -q; then
+                      echo -e "\n${item^} may not run well in a Virtual Machine."
+                      echo "At least you should have 3D acceleration in this VM."
+                      msg="Install $item anyway [y/N]? "
+                      read -rp "$msg"; echo
+                    else
+                      REPLY=yes
+                    fi
+                    [[ ${REPLY,,} =~ y(es)? ]] && "install_$item"
+                    shift
+                    ;;
+                kde|plasma|gnome|mate)
+                    [[ $2 == full ]] && { "install_$item" full; shift; } || "install_$item"
+                    shift
+                    ;;
+                rofi)
+                    [[ $2 == -qtile ]] && { "install_$item" "$2"; shift; } || "install_$item"
+                    shift
+                    ;;
+                lightdm)
+                    if [[ $2 ==  aether ]] || [[ $2 == slick ]]; then
+                      "install_$item" "$2"
+                      shift
+                    else
+                      "install_$item"
+                    fi
+                    shift
+                    ;;
+                pamac)
+                    if [[ $2 == all ]] || [[ $2 == -all ]]; then
+                       "install_$item" all
+                       shift
+                    else
+                       "install_$item"
+                    fi
+                    shift
+                    ;;
+                pamac-all)
+                    install_pamac all
+                    shift
+                    ;;
+                brave)
+                    if [[ $2 == beta ]] || [[ $2 == -beta ]]; then
+                       "install_$item" beta
+                       shift
+                    else
+                       "install_$item"
+                    fi
+                    shift
+                    ;;
+                brave-beta)
+                    "install_brave" beta
+                    shift
+                    ;;
+                autologin)
+                    [[ $desktop ]] && "install_$item" "$desktop"
+                    shift
+                    ;;
+                ssh-key)
+                    gen_ssh "$USR"
+                    shift
+                    ;;
+                x11vnc) 
+                    install_x11vnc "$USR"
+                    shift
+                    ;;
+                zsh)
+                    [[ -h $0 ]] && n="$(readlink "$0")" || n="$0"
+                    zsh_installer="$(find "$(dirname "$n")" -type f -name 'zsh-install' -print)"
+                    [[ ${2,,} == omz || ${2,,} == own ]] && opt=("${2,,}") || opt=()
+                    # fix systemd-homed artifacts 
+                    [[ $(stat -c %G "$HOME/.bashrc") == "$USR" ]] || sudo chown "$USR": "$HOME"/.bash*
+                    [[ -d "$HOME/.gnupg" ]] && { [[ $(stat -c %G "$HOME/.gnupg") == "$USR" ]] || sudo chown -R "$USR": "$HOME/.gnupg"; }
+                    [[ -s "$zsh_installer" ]] && [[ ! -d ~/.config/dmscripts/dmsounds ]] && "$zsh_installer" "${opt[@]}" # Don't run on DTOS
+                    [[ -s "$XDG_DATA_HOME/zsh/history" ]] || echo ": $(date +%s):0;$(basename "$0") $*" >> "$XDG_DATA_HOME/zsh/history"
+                    shift; ((${#opt[*]} > 0)) && shift;
+                    ;;
+                *)
+                    log "Error! Unknown item: $item"
+                    shift
+                    ;;
+            esac
+        done
+
+        if systemctl is-enabled -q display-manager || \
+        { [ -s ~/.xprofile ] && grep -qF startx ~/.xprofile; } || \
+        { [ -s ~/.xinitrc ] && grep -qF startx ~/.xinitrc; }; then
+            [ -s /etc/motd ] && grep -qF desktop /etc/motd && sudo truncate -s 0 /etc/motd
+        fi
+        systemctl is-enabled -q dbus-broker &>/dev/null && systemctl enable -f --user dbus-broker &>/dev/null
+        # Enable subpixel rendering of fonts (default is rgb, edit the linkname if monitor is e.g. bgr)
+        [[ -d "${XDG_CONFIG_HOME:-$HOME/.config}/fontconfig/conf.d" ]] || mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/fontconfig/conf.d"
+        [[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/fontconfig/conf.d/10-sub-pixel-rgb.conf" ]] || ln -s /usr/share/fontconfig/conf.avail/10-sub-pixel-rgb.conf "${XDG_CONFIG_HOME:-$HOME/.config}/fontconfig/conf.d"
+        [[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/fontconfig/conf.d/10-hinting-slight.conf" ]] || ln -s /usr/share/fontconfig/conf.avail/10-hinting-slight.conf "${XDG_CONFIG_HOME:-$HOME/.config}/fontconfig/conf.d"
+        if (($(find /usr/share/xsessions -iname "*.desktop" 2>/dev/null| wc -l) + $(find /usr/share/wayland-sessions -iname "*.desktop" 2>/dev/null | wc -l) > 0)); then
+            # Download an archlinux icon into $HOME/Pictures or whatever it is called in your locale
+            [[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/user-dirs.dirs" ]] && icon_dir="$(xdg-user-dir PICTURES)"
+            icon_source="https://www.archlinux.org/logos/archlinux-icon-crystal-64.svg"
+            [[ -e "${icon_dir:-$HOME}/$(basename "$icon_source")" ]] || wget --output-document "${icon_dir:-$HOME}/$(basename "$icon_source")" "$icon_source" &>/dev/null
+            icon_source="https://www.iconfinder.com/icons/386451/download/svg/4096"
+            [[ -e "${icon_dir:-$HOME}/archlinux-icon.svg" ]] || wget --output-document "${icon_dir:-$HOME}/archlinux-icon.svg" "$icon_source" &>/dev/null
+        fi
+        [[ ! -d "${XDG_CACHE_HOME:-$HOME/.cache}/tealdeer" ]] && which tldr &>/dev/null && tldr --update &>/dev/null
+        [[ $(stat -c %G "$HOME"/.bashrc) == "$USR" ]] || sudo chown "$USR": "$HOME"/.bash*
+        [[ -d "$HOME/.gnupg" ]] && { [[ $(stat -c %G "$HOME/.gnupg") == "$USR" ]] || sudo chown -R "$USR": "$HOME/.gnupg"; }
+        usage -s
+        log_print
+        
+    fi
+}
+
+main "$@"
