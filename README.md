@@ -43,8 +43,13 @@ LOCALE=fi_FI
 Save and exit.
 You now have your own `custom.conf` file.
 
-Now you are ready to start the installer. You may want to check the options of
-the installer first
+Now you are ready to start the installer. It just must be executable, so run:
+
+```
+chmod +x arch-install/arch-install
+```
+ 
+You may want to check the options of the installer first
 
 ```
 arch-install/arch-install -h
