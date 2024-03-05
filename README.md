@@ -21,10 +21,13 @@ After booting from that image, first, and only if needed, set your keymap, like
 e.g. `loadkeys fi` for finnish. Next download this installer:
 
 ```
+git -v || pacman -Sy git
 git clone https://github.com/tfjade/arch-install.git
 ```
-You'll find all options in the base config file `arch-install/arch-install.conf`.
-Either edit the base config `arch-install/arch-install.conf`, or create your own
+The first line just ensures git is installed.
+
+You'll find all options for *arch-install* in the base config file `arch-install/arch-install.conf`.
+Either edit the base config file, or create your own
 custom conf file. At least you'll want to set the **KEYMAP** and **LOCALE**
 variables, unless you are in the US.
 
