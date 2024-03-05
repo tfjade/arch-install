@@ -1369,10 +1369,8 @@ _install_systemd-boot() {
     [[ $efi == /boot ]] || ep="/EFI/Linux"
     echo -e "default arch-${KERNEL[0]}.*\ntimeout ${timeout}\nconsole-mode keep" > "${efi}/loader/loader.conf"
     entry="${efi}/loader/entries/arch.conf"
-    [[ $ep ]] && echo -e "# This entry wont't work, unless the kernel, initramfs and ucodes\n# are copied to the esp at ${efi}${ep}/\n# Check file /etc/mkinitcpio.d/${KERNEL[0]}.preset" > "$entry"
-    echo "title Arch Linux" >> "$entry"
-    echo "linux ${ep}/vmlinuz-${KERNEL[0]}" >> "$entry"
-    echo "initrd ${ep}/initramfs-${KERNEL[0]}.img" >> "$entry"
+    [[ $ep ]] && echo -e "# This entry wont't work, unless the kernel and initramfs\n# are copied to the esp at ${efi}${ep}/\n# Check file /etc/mkinitcpio.d/${KERNEL[0]}.preset" > "$entry"
+    echo -e "title Arch Linux\nlinux ${ep}/vmlinuz-${KERNEL[0]}\ninitrd ${ep}/initramfs-${KERNEL[0]}.img" >> "$entry"
 
     [[ $cryptname ]] && _encrypted_boot_systemd -d "$disk" -c "$cryptname" -u "$uuid" --
     if [[ $rootname == /dev/mapper/* || $rootname == /dev/volgroup* ]]; then
