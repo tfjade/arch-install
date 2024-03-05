@@ -559,9 +559,9 @@ create_partitions_efi() {
     echo "EFI system"
     # Create esp unless one exists. MUST include -u$i:$GUID_ESP because this script depends on it later.
     # If EFI is not /boot and bootloader not Grub, the esp size is 256M * the number of kernels
-    # installed, or at least 320M.
+    # installed, or at least 512M.
     [[ $EFI != /boot ]] && [[ ${BOOT_LOADER,,} != grub* ]] && efisize=$((256 * ${#KERNEL[@]}))M
-    efisize=$(max 320M "$efisize")
+    efisize=$(max 512M "$efisize")
     if [[ ! -b "$ESP" ]] && ! [[ $(detect_esp --) && $ESP == "$disk"* ]]; then
         sgdisk --set-alignment=$((2**20/${SECTOR_SIZE:-512})) -n"$i"::+"$efisize" -t"$i":ef00 -u"$i":"$GUID_ESP" "$disk" && ESP="${disk}${p}$((i++))"
     fi
