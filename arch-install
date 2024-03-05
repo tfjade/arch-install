@@ -2762,6 +2762,7 @@ validate_conf() {
     [[ $HOME_PARTITION ]] && ROOT_SIZE=${ROOT_SIZE:-"50%"}
     [[ $ROOT_SIZE ]] && validate_root_size
     [[ $SWAP_SIZE ]] && validate_swap_size
+    return 0
 }
 
 read_base_config() {
