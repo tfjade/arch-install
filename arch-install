@@ -1255,60 +1255,36 @@ Exec = /usr/local/bin/sbctl-sign" > "$f"
 # Configure the system to use Unified Kernel Image with mkinitcpio.
 # Systemd-boot, rEFInd and EFISTUB use this, if esp is not mounted to /boot
 unified_kernel_image() {
-    local efi opt quiet secboot preset k
+    local efi opt quiet secboot preset
 
     while [[ $1 ]]; do
       case "$1" in
-             -e | --efi) efi="$2"; shift 2;;
-         -o | --options) opt="$2"; shift 2;;
-           -q | --quiet) echo "quiet bgrt_disable loglevel=3 rd.systemd.show_status=auto rd.udev.log_level=3" > /etc/cmdline.d/quiet.conf
-                         shift;;
-      -s | --secureboot) secboot=yes; shift;;
-                     --) shift; break;;
-                      *) shift;;
+             -e | --efi) 
+                        efi="$2"; shift 2;;
+         -o | --options) 
+                        opt="$2"; shift 2;;
+           -q | --quiet)
+                        echo "quiet bgrt_disable loglevel=3 rd.systemd.show_status=auto rd.udev.log_level=3" > /etc/cmdline.d/quiet.conf
+                        shift;;
+      -s | --secureboot)
+                        secboot=yes; shift;;
+                     --)
+                        shift; break;;
+                      *)
+                        shift;;
       esac
     done
     [[ -d "$efi" && $efi != /boot ]] || return 1
     [[ $opt ]] && echo "${opt}" > /etc/kernel/cmdline
     mkdir -p "$efi/EFI/Linux"
-    # By default, the kernel, initramfs and ucodes are NOT copied to the esp,
-    # because the Unified Kernel Image will boot without them.
-    # However, see under this block, how to activate the copying.
-    rm -f /etc/mkinitcpio.d/*.preset
-    preset="/etc/mkinitcpio.d/${KERNEL[0]}.preset"
-    echo \
-"# mkinitcpio preset file for the '${KERNEL[0]}' package
 
-# Directory where to create the efi images
-ESP_DIR=\"${efi}/EFI/Linux\"
-
-#ALL_config=\"/etc/mkinitcpio.conf\"
-ALL_kver=\"/boot/vmlinuz-${KERNEL[0]}\"
-#cp -af /boot/vmlinuz-${KERNEL[0]} \"\${ESP_DIR}/\"
-
-PRESETS=('default' 'fallback')
-
-#default_config=\"/etc/mkinitcpio.conf\"
-default_image=\"/boot/initramfs-${KERNEL[0]}.img\"
-default_uki=\"\${ESP_DIR}/arch-${KERNEL[0]}.efi\"
-default_options=\"quiet --splash /usr/share/systemd/bootctl/splash-arch.bmp\"
-#cp -af /boot/initramfs-${KERNEL[0]}.img \"\${ESP_DIR}/\"
-
-#fallback_config=\"/etc/mkinitcpio.conf\"
-fallback_image=\"/boot/initramfs-${KERNEL[0]}-fallback.img\"
-fallback_uki=\"\${ESP_DIR}/arch-${KERNEL[0]}-fallback.efi\"
-fallback_options=\"-S autodetect\"
-#cp -af /boot/initramfs-${KERNEL[0]}-fallback.img \"\${ESP_DIR}/\"" >> "$preset"
-
-    # If you want to activate the copying of the kernel and initramfs to the esp,
-    # uncomment the following line:
-    #sed -i '/^#cp/s/^#//' $preset
-
-    # Create presets for all installed kernels, and run mkinitcpio on them
-    for k in "${KERNEL[@]}"; do
-        [[ $k == "${KERNEL[0]}" ]] || sed "s/${KERNEL[0]}/$k/" "$preset" > "/etc/mkinitcpio.d/${k}.preset"
-        mkinitcpio -p "$k"
+    for preset in /etc/mkinitcpio.d/*.preset; do
+        sed -i "2a # Directory for the uki efi images\nESP_DIR=\"${efi}/EFI/Linux\"\n" "$preset"
+        sed -i '/_uki=/s/^#//' "$preset"
+        sed -i '/_uki=/s,="/efi/EFI/Linux,="${ESP_DIR},' "$preset"
+        sed -i '/default_options=/s/^#//' "$preset" # splash screen
     done
+    mkinitcpio -P
 }
 
 # Handle /etc/mkinitcpio.conf HOOKS when the rootfs is encrypted,
