@@ -1279,9 +1279,9 @@ unified_kernel_image() {
     mkdir -p "$efi/EFI/Linux"
 
     for preset in /etc/mkinitcpio.d/*.preset; do
-        sed -i "2a # Directory for the uki efi images\nESP_DIR=\"${efi}/EFI/Linux\"\n" "$preset"
+        sed -i "2a # Directory where the esp is mounted\nESP_DIR=\"${efi}\"\n" "$preset"
         sed -i '/_uki=/s/^#//' "$preset"
-        sed -i '/_uki=/s,="/efi/EFI/Linux,="${ESP_DIR},' "$preset"
+        sed -i '/_uki=/s,="/efi,="${ESP_DIR},' "$preset"
         sed -i '/default_options=/s/^#//' "$preset" # splash screen
     done
     mkinitcpio -P
