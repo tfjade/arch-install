@@ -21,7 +21,7 @@ After booting from that image, first, and only if needed, set your keymap, like
 e.g. `loadkeys fi` for finnish. Next download this installer:
 
 ```
-pacman -Sy --needed git
+pacman-key --init archlinux && pacman -Sy --needed git
 git clone https://github.com/tfjade/arch-install.git
 ```
 The first line just ensures git is installed.
