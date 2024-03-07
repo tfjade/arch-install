@@ -1111,6 +1111,9 @@ install_plasma() {
     sudo sed -i '/Session=/s/=.*/=plasma/' /etc/sddm.conf.d/autologin.conf
     #lsblk | grep -qw crypt && install_autologin plasma
 
+    # drop QT_QPA_PLATFORMTHEME
+    sudo sed -i '/^QT_QPA_PLATFORMTHEME=/s/^/#/' /etc/profile.d/env-vars.sh
+
     log "Please, reboot to start KDE Plasma."
 }
 
