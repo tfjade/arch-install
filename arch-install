@@ -1255,7 +1255,7 @@ Exec = /usr/local/bin/sbctl-sign" > "$f"
 # Configure the system to use Unified Kernel Image with mkinitcpio.
 # Systemd-boot, rEFInd and EFISTUB use this, if esp is not mounted to /boot
 unified_kernel_image() {
-    local efi opt quiet secboot preset
+    local efi opt quiet secboot ed preset
 
     while [[ $1 ]]; do
       case "$1" in
@@ -1276,13 +1276,15 @@ unified_kernel_image() {
     done
     [[ -d "$efi" && $efi != /boot ]] || return 1
     [[ $opt ]] && echo "${opt}" > /etc/kernel/cmdline
-    mkdir -p "$efi/EFI/Linux"
+    ed="$(sed -En '/default_uki=/s,.*"/efi/(.*)/.*,\1,p' /etc/mkinitcpio.d/"${KERNEL[0]}".preset)"
+    : "${ed:="EFI/Linux"}"
+    mkdir -p "$efi/${ed}"
 
     for preset in /etc/mkinitcpio.d/*.preset; do
         sed -i "2a # Directory where the esp is mounted\nESP_DIR=\"${efi}\"\n" "$preset"
         sed -i '/_uki=/s/^#//' "$preset"
-        sed -i '/_uki=/s,="/efi,="${ESP_DIR},' "$preset"
-        sed -i '/default_options=/s/^#//' "$preset" # splash screen
+        sed -i "/_uki=/s,=\".*/,=\"\${ESP_DIR}/${ed}/," "$preset"
+        [[ -e /etc/cmdline.d/quiet.conf ]] && sed -i '/default_options=/s/^#//' "$preset" # splash screen
     done
     mkinitcpio -P
 }
