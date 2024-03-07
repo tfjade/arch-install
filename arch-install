@@ -2097,7 +2097,7 @@ fi
 [[ -e /usr/bin/vim ]] && EDITOR=vim
 [[ -e /usr/bin/nvim ]] && EDITOR=nvim
 
-# Set theme for QT apps
+# Set theme for QT apps. Not with KDE!
 QT_QPA_PLATFORMTHEME=qt5ct
 
 # Export everything maybe set in this file
