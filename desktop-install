@@ -1111,9 +1111,6 @@ install_plasma() {
     sudo sed -i '/Session=/s/=.*/=plasma/' /etc/sddm.conf.d/autologin.conf
     #lsblk | grep -qw crypt && install_autologin plasma
 
-    # drop QT_QPA_PLATFORMTHEME
-    sudo sed -i '/^QT_QPA_PLATFORMTHEME=/s/^/#/' /etc/profile.d/env-vars.sh
-
     log "Please, reboot to start KDE Plasma."
 }
 
@@ -1993,11 +1990,8 @@ install_hyprland() {
         systemd-detect-virt -q && sed -i "/monitor=/s/=.*/=Virtual-1,$VIRT_RESOLUTION,0x0,1/" "$f"
         
         # Default filemanager is dolphin (from KDE/Plasma)
-        # Unless KDE/Plasma is also installed, dolphin is not very nice, so choose nemo
-        [[ -e /usr/share/wayland-sessions/plasmawayland.desktop ]] || filemanager="nemo"
-        
         # If you want nemo or thunar, set filemanager to either "nemo" or "thunar"
-        filemanager="nemo"
+        #filemanager="nemo"
         
         if ! grep -q "fileManager = ${filemanager:-dolphin}" "$f"; then
             case "$filemanager" in
@@ -2008,9 +2002,14 @@ install_hyprland() {
                 thunar) 
                     sudo pacman -S --noconfirm --needed thunar
                     ;;
+
             esac
             sed -i "/fileManager =/s/=.*/= $filemanager/" "$f"
             log "Hint: Select GTK theme with \"GTK Settings\" i.e. nwg-look."
+        fi
+        if grep -q 'fileManager = dolphin' "$f"; then
+            filemanager="dolphin"
+            grep -q '|Hyprland' /etc/profile.d/env-vars.sh || sudo sed -i '/ QT_QPA_PLATFORMTHEME=/s/)/|Hyprland)/' /etc/profile.d/env-vars.sh
         fi
 
         # windowrules v1, these will float
