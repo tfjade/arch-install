@@ -1133,7 +1133,7 @@ install_gnome() {
     set +e
     # Set the default terminal
     command -v kitty && term='kitty'
-    [[ $term ]] || command -v alacritty && term='alacritty'
+    [[ $term ]] || { command -v alacritty && term='alacritty'; }
     [[ $term ]] || term='gnome-console'
     # in gnome 43 by default this was still 'gnome-terminal'
     gsettings set org.gnome.desktop.default-applications.terminal exec "$term"
