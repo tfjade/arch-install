@@ -1198,8 +1198,8 @@ install_xfce() {
 }
 
 install_lxqt() {
-    sudo pacman -Sq --noconfirm --needed xorg-server lxqt xdg-desktop-portal-lxqt arc-gtk-theme papirus-icon-theme kvantum xscreensaver
-    install_aur_pkg -q kvantum-theme-arc arc-kde
+    sudo pacman -Sq --noconfirm --needed xorg-server lxqt lxqt-build-tools xdg-desktop-portal-lxqt arc-gtk-theme papirus-icon-theme kvantum xscreensaver
+    install_aur_pkg -q labwc lxqt-labwc-session-git labwc-tweaks-git kvantum-theme-arc arc-kde
     systemctl -q is-enabled NetworkManager && install_aur_pkg -q nm-tray
     if ! systemctl is-enabled -q display-manager &>/dev/null; then
         install_display-manager
