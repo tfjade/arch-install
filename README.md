@@ -39,7 +39,7 @@ nano custom.conf
 Use **nano** or **vim**. Being in Finland, here's the bare minimum what I would
 always set:
 
-```
+```sh
 KEYMAP=fi
 LOCALE=fi_FI
 ```
