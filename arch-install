@@ -8,15 +8,6 @@
 
 ###############################################################################
 
-# On EFI system, where to mount the EFI esp, /boot, /boot/efi or /efi?
-# If Grub with encryption, a separate boot partition is created for /boot,
-# if the EFI esp is something else than /boot
-EFI="/boot/efi"
-
-# If encryption is selected, default luks2 encryption volume name is "cryptvol".
-# You may change this according to taste. It could be e.g. "cryptroot"
-CRYPTVOL_NAME="cryptvol"
-
 # Some partition UUIDs according to The Discoverable Partition Specification
 # DO NOT CHANGE THESE without a valid reason
 GUID_ESP="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
@@ -2740,6 +2731,13 @@ validate_conf() {
     [[ $HOME_PARTITION ]] && ROOT_SIZE=${ROOT_SIZE:-"50%"}
     [[ $ROOT_SIZE ]] && validate_root_size
     [[ $SWAP_SIZE ]] && validate_swap_size
+    # On EFI system, where to mount the EFI esp, /boot, /boot/efi or /efi?
+    # If Grub with encryption, a separate boot partition is created for /boot,
+    # if the EFI esp is something else than /boot
+    EFI="${EFI:-"/efi"}"
+    # If encryption is selected, default luks2 encryption volume name is "cryptvol".
+    # You may change this according to taste. It could be e.g. "cryptroot"
+    CRYPTVOL_NAME="${CRYPTVOL_NAME:-"cryptvol"}"
     return 0
 }
 
@@ -2767,12 +2765,23 @@ custom_conf() {
     CUSTOM_CONF+=("${conf[@]}")
 }
 
+parse_cli_option() {
+    local arr opt tmp_file
+    IFS=',' read -r -a arr <<< "$1"
+    ((${#arr[*]})) || return 1
+    tmp_file="$(mktemp /tmp/XXXXX)"
+    for opt in "${arr[@]}"; do
+        [[ $opt =~ = ]] && echo "$opt" >> "$tmp_file"
+    done
+    [[ -s "$tmp_file" ]] && custom_conf "$tmp_file" || rm "$tmp_file"
+    return 0
+}
 
 # check options, read all custom conf files, and start reflector in the background, 
 # unless user chooses not to run reflector (-n)
 check_options() {
     local args country
-    if ! args=$(getopt -o c:e:i:R:H:hny -l conf:,efi:,root:,home:,country:,no-reflector,help,yes -- "$@"); then
+    if ! args=$(getopt -o c:e:i:o:R:H:hny -l conf:,option:,efi:,root:,home:,country:,no-reflector,help,yes -- "$@"); then
         echo -e "Check options: $*"
         exit 1
     fi
@@ -2780,19 +2789,22 @@ check_options() {
     eval set -- "$args"
     while [[ $1 ]]; do
       case "$1" in
-        -n|--no-reflector) 
+        -n|--no-reflector)
                     SKIP_REFLECTOR=yes; shift
                     ;;
-             -c|--country) 
+             -c|--country)
                     country="$2"; shift 2
                     ;;
-                -i|--conf) 
+                -i|--conf)
                     custom_conf "$2" && shift 2 || { echo "Error: Cannot import conf from '$2'."; exit 1; }
                     ;;
-                 -E|--efi) 
+              -o|--option)
+                    parse_cli_option "$2" && shift 2 || { echo "Error: Cannot parse option '$2'"; exit 1; }
+                    ;;
+                 -E|--efi)
                     [[ -b "$2" ]] && ESP="$2" && save_with_parents "$2" && shift 2 || { echo "Error: Option $1 must be followed by a valid esp partition path."; exit 1; }
                     ;;
-                -R|--root) 
+                -R|--root)
                     [[ -b "$2" ]] && VGPART="$2" && save_with_parents "$2" && shift 2 || { echo "Error: Option $1 must be followed by a valid root partition path."; exit 1; }
                     ;;
                 -H|--home)
@@ -2801,7 +2813,7 @@ check_options() {
                 -y|--yes)
                      YES=yes; shift
                      ;;
-                -h|--help) 
+                -h|--help)
                     echo -e \
 "
 Usage: $(basename "$0") [options]
@@ -2811,6 +2823,11 @@ options:
         Include config file <conf>. This <conf> can be a directory, which should
         contain one or many *.conf file(s), or a filepath to a specific config 
         file of any name.
+
+    -o, --option <OPT=value>
+        Set option OPT to 'value'. All the configuration options that are in
+        the base config file 'arch-install.conf' can be set from the cli like this.
+        Multiple options can be set at once separated by commas (,).
 
     -n, --no-reflector
         Skip using reflector to rank the mirrors.
