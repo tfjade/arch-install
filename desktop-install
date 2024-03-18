@@ -1186,7 +1186,7 @@ install_mate() {
 }
 
 install_xfce() {
-    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps xfce4 xfce4-goodies xdg-desktop-portal-gtk arc-gtk-theme papirus-icon-theme
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps xfce4 xfce4-goodies xdg-desktop-portal-gtk lxsession arc-gtk-theme papirus-icon-theme
     systemd-detect-virt -q || sudo pacman -Sq --noconfirm --needed simple-scan
     install_aur_pkg -q ocs-url
     set_xkeymap
