@@ -2000,7 +2000,7 @@ install_hyprland() {
         
         # Default filemanager is dolphin (from KDE/Plasma)
         # If you want nemo or thunar, set filemanager to either "nemo" or "thunar"
-        #filemanager="nemo"
+        filemanager="nemo"
         
         if ! grep -q "fileManager = ${filemanager:-dolphin}" "$f"; then
             case "$filemanager" in
@@ -2019,6 +2019,7 @@ install_hyprland() {
         if grep -q 'fileManager = dolphin' "$f"; then
             filemanager="dolphin"
             grep -q '|Hyprland' /etc/profile.d/env-vars.sh || sudo sed -i '/ QT_QPA_PLATFORMTHEME=/s/)/|Hyprland)/' /etc/profile.d/env-vars.sh
+            #grep -q '[^#]env = QT_QPA_PLATFORMTHEME' "$f" && sed -i '/env = QT_QPA_PLATFORMTHEME/s/^/#/' "$f"
         fi
 
         # windowrules v1, these will float
@@ -2047,14 +2048,13 @@ install_hyprland() {
       sed -i '/^env =/,/^$/s/^$/env = WLR_NO_HARDWARE_CURSORS,1\n&/' "$f"
 
     # waybar
-    f="$HOME/.config/waybar/config"
+    f="$HOME/.config/waybar/config.jsonc"
     if [[ ! -e "$f" ]]; then
         [[ -d "$(dirname "$f")" ]] || mkdir "$(dirname "$f")"
         [[ -e "$f" ]] || cp /etc/xdg/waybar/* "$(dirname "$f")/"     
-        # enable "hyprland/window" in the center
-        sed -i '/"modules-center":/s/sway/hyprland/' "$f"
-        # enable and uncomment workspaces
-        sed -i 's,sway/workspaces,hyprland/workspaces,g' "$f"
+        sed -Ei '/"modules-(left|center|right)":/,/]/s/"sway/"hyprland/' "$f"
+        # enable hyprland workspaces
+        sed -i 's,"sway/workspaces":,"hyprland/workspaces":,' "$f"
         m=$(mktemp /tmp/XXXX)
         awk '/"hyprland\/workspaces":/ {f=1} f && $1=="//" {sub(/\/\/ /,"")} $1~/},/ {f=0} 1' "$f" > "$m" && cp "$m" "$f" && rm "$m"
         # font-size 14px in waybar (could be even bigger)
@@ -2066,7 +2066,7 @@ install_hyprland() {
         m="\"custom/updates\": {\n        \"format\": \"{} {icon}\",\n        \"return-type\": \"json\",\n        \"format-icons\": {\n            \"has-updates\": \"󱍷 \",\n            \"updated\": \"󰂪\"\n        },\n        \"exec-if\": \"which waybar-module-pacman-updates\",\n        \"exec\": \"waybar-module-pacman-updates\"\n    }"
         sed -i "/^}/i $m" "$f" && sed -zi 's/}\n"/},\n    "/' "$f"
         # Show it on the right before "clock" 
-        sed -i '/"modules-right":/s|"clock"|"custom/updates", &|' "$f"
+        sed -i '/"modules-right":/,/]/s|"clock"|"custom/updates",\n        &|' "$f"
     fi
 
     # enable display/login manager (sddm or gdm)
