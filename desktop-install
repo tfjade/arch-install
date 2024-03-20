@@ -2040,7 +2040,7 @@ install_hyprland() {
         sed -i '/# Example windowrule v2/,/^$/s/^$/windowrulev2 = noanim,class:^(wofi)$\n&/' "$f"
 
         # This tames the mouse in QEMU/libvirt when 3D acceleration is enabled
-        [[ $(systemd-detect-virt) == kvm ]] && sed -i '/# Example windowrule v1/i device:qemu-qemu-usb-tablet {\n    sensitivity = -0.5\n}\n' "$f"
+        [[ $(systemd-detect-virt) == kvm ]] && sed -i '/# Example windowrule v1/i device {\n    name = qemu-qemu-usb-tablet\n    sensitivity = -0.5\n}\n' "$f"
     fi
 
     # when 3D acceleration is on in virt-manager, this must be added to get a "usable" mouse
