@@ -266,6 +266,7 @@ f=$conf
     sed -i '/^\s*linux_display_server x11/s/^/#/' \"\$f\"
 " > "$f/kitty-fix" && chmod +x "$f/kitty-fix"
         if [[ -e "$f/kitty-fix" ]]; then
+            [[ $XDG_CURRENT_DESKTOP == GNOME ]] && "$f/kitty-fix"
             [[ -d "$HOME/.config/autostart" ]] || mkdir "$HOME/.config/autostart"
             [[ -e "$HOME/.config/autostart/kitty-fix.desktop" ]] || echo \
 "[Desktop Entry]
@@ -1156,8 +1157,8 @@ install_gnome() {
     # GDM is by default the display manager in Gnome
     install_gdm
 
-    install_aur_pkg -q gnome-shell-extension-pop-shell-bin
-    install_aur_pkg -q gnome-shell-extension-arch-update
+    #install_aur_pkg -q gnome-shell-extension-pop-shell-bin
+    #install_aur_pkg -q gnome-shell-extension-arch-update
 
     # Lots of packages to choose from:
     [[ $1 == full ]] && sudo pacman -S gnome-extra
@@ -2022,6 +2023,8 @@ install_hyprland() {
             #grep -q '[^#]env = QT_QPA_PLATFORMTHEME' "$f" && sed -i '/env = QT_QPA_PLATFORMTHEME/s/^/#/' "$f"
         fi
 
+        # add empty line
+        sed -i '/^# Example windowrule v2/i\\' "$f"
         # windowrules v1, these will float
         for t in pavucontrol blueman-manager nm-connection-editor $filemanager; do
             sed -i "/# Example windowrule v1/,/^$/s/^$/windowrule = float, ^($t)$\n&/" "$f"
