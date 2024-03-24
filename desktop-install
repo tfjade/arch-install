@@ -1156,8 +1156,8 @@ install_gnome() {
     # GDM is by default the display manager in Gnome
     install_gdm
 
-    install_aur_pkg -q gnome-shell-extension-pop-shell-bin
-    install_aur_pkg -q gnome-shell-extension-arch-update
+    #install_aur_pkg -q gnome-shell-extension-pop-shell-bin
+    #install_aur_pkg -q gnome-shell-extension-arch-update
 
     # Lots of packages to choose from:
     [[ $1 == full ]] && sudo pacman -S gnome-extra
