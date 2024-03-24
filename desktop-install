@@ -2023,6 +2023,8 @@ install_hyprland() {
             #grep -q '[^#]env = QT_QPA_PLATFORMTHEME' "$f" && sed -i '/env = QT_QPA_PLATFORMTHEME/s/^/#/' "$f"
         fi
 
+        # add empty line
+        sed -i '/^# Example windowrule v2/i\\' "$f"
         # windowrules v1, these will float
         for t in pavucontrol blueman-manager nm-connection-editor $filemanager; do
             sed -i "/# Example windowrule v1/,/^$/s/^$/windowrule = float, ^($t)$\n&/" "$f"
