@@ -266,6 +266,7 @@ f=$conf
     sed -i '/^\s*linux_display_server x11/s/^/#/' \"\$f\"
 " > "$f/kitty-fix" && chmod +x "$f/kitty-fix"
         if [[ -e "$f/kitty-fix" ]]; then
+            [[ $XDG_CURRENT_DESKTOP == GNOME ]] && "$f/kitty-fix"
             [[ -d "$HOME/.config/autostart" ]] || mkdir "$HOME/.config/autostart"
             [[ -e "$HOME/.config/autostart/kitty-fix.desktop" ]] || echo \
 "[Desktop Entry]
