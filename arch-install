@@ -2089,7 +2089,7 @@ fi
 [[ -e /usr/bin/nvim ]] && EDITOR=nvim
 
 # Set theme for QT apps. Not with KDE, incompatible with dolphin.
-[[ \$XDG_CURRENT_DESKTOP =~ (KDE) ]] || QT_QPA_PLATFORMTHEME=qt5ct
+[[ \$XDG_CURRENT_DESKTOP == KDE ]] || QT_QPA_PLATFORMTHEME=qt5ct
 
 # Export everything maybe set in this file
 export PATH XDG_CONFIG_DIRS XDG_DATA_DIRS XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME EDITOR QT_QPA_PLATFORMTHEME
@@ -2660,6 +2660,13 @@ inside_chroot() {
     # Shorten some long shutdown delays (default timeout is 90s)
     mkdir -m 0755 /etc/systemd/{system,user}.conf.d
     echo -e "[Manager]\nDefaultTimeoutStopSec=10s" | tee /etc/systemd/system.conf.d/system.conf > /etc/systemd/user.conf.d/user.conf
+
+    # Set some sysctl values
+    echo \
+"# Increase the number of virtual memory areas that one process may request
+vm.max_map_count=$((2**20))
+# Decrease tendency to use swap
+vm.swappiness=5" > /etc/sysctl.d/99-sysctl.conf
 
     # Set reflector default args. Please, verify these settings before starting the reflector service or timer
     f=/etc/xdg/reflector/reflector.conf
