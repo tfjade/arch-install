@@ -2019,7 +2019,7 @@ install_hyprland() {
         fi
         if grep -q 'fileManager = dolphin' "$f"; then
             filemanager="dolphin"
-            grep -q '|Hyprland' /etc/profile.d/env-vars.sh || sudo sed -i '/ QT_QPA_PLATFORMTHEME=/s/)/|Hyprland)/' /etc/profile.d/env-vars.sh
+            grep -q '= Hyprland' /etc/profile.d/env-vars.sh || sudo sed -i '/ QT_QPA_PLATFORMTHEME=/s/]]/|| $XDG_CURRENT_DESKTOP == Hyprland ]]/' /etc/profile.d/env-vars.sh
             #grep -q '[^#]env = QT_QPA_PLATFORMTHEME' "$f" && sed -i '/env = QT_QPA_PLATFORMTHEME/s/^/#/' "$f"
         fi
 
