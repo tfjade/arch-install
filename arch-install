@@ -554,7 +554,7 @@ create_partitions_efi() {
     [[ $EFI != /boot ]] && [[ ${BOOT_LOADER,,} != grub* ]] && efisize=$((256 * ${#KERNEL[@]}))M
     efisize=$(max 512M "$efisize")
     if [[ ! -b "$ESP" ]] && ! [[ $(detect_esp --) && $ESP == "$disk"* ]]; then
-        sgdisk --set-alignment=$((2**20/${SECTOR_SIZE:-512})) -n"$i"::+"$efisize" -t"$i":ef00 -u"$i":"$GUID_ESP" "$disk" && ESP="${disk}${p}$((i++))"
+        sgdisk --set-alignment=$((2**20/${SECTOR_SIZE:-512})) -n"$i"::+"$efisize" -t"$i":ef00 -u"$i":"$GUID_ESP" "$disk" && ESP="${disk}${p}"$((i++))
     fi
 
     if [[ -n $ENCRYPT && ${BOOT_LOADER,,} == grub* && $EFI != /boot ]]; then
