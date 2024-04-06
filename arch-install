@@ -2406,37 +2406,40 @@ install_amdgpu_driver() {
     sed -i '/^MODULES=/s/)/ amdgpu)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
     # Linux AMDGPU Control Application is in the AUR
     aur_install lact
-    systemctl enable lactd 
+    systemctl enable lactd
 }
 
 nvidia_boot_settings() {
     # if already done, nothing to do
     grep -q '^MODULES=.*nvidia' /etc/mkinitcpio.conf && return
-    echo -e "blacklist nouveau\noptions nouveau modeset=0" > /etc/modprobe.d/blacklist-nouveau.conf
     echo "nvidia-drm.modeset=1" > /etc/cmdline.d/nvidia.conf
-    sed -i '/^MODULES=/s/)/ nvidia nvidia_modeset nvidia_uvm nvidia_drm)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+    sed -i '/^HOOKS=/s/ kms / /;/^MODULES=/s/)/ nvidia nvidia_modeset nvidia_uvm nvidia_drm)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
 }
 
 # AUR is needed for older model Nvidia GPU drivers. THESE MAY OR MAY NOT WORK.
 # Dkms versions are installed.
 # Many prefer the linux-lts kernel with Nvidia, less chance of problems, perhaps.
 install_nvidia_driver() {
-    local nvidia_hook f k
+    local target nvidia_hook f k
     sed -i '/^#\[multilib\]/,/^$/s/^#//' /etc/pacman.conf # enable multilib
     pacman -Sy
     if lspci | grep -Eiq '(VGA|3D).*NVIDIA.*(GTX? (9|10)[0-9]{2}|RTX|MX[1-4]|TITAN)'; then
         pacman -Sq --noconfirm --needed nvidia-dkms nvidia-utils opencl-nvidia nvidia-settings libglvnd nvtop \
             lib32-libglvnd lib32-nvidia-utils lib32-opencl-nvidia
+        target=nvidia-dkms
         nvidia_hook=1
     elif lspci | grep -Eiq '(VGA|3D).*NVIDIA.*GTX? ([78][0-9]{2}|6[0-9]{2}[^M])'; then
         aur_install nvidia-470xx-dkms nvidia-470xx-utils nvidia-470xx-settings lib32-nvidia-470xx-utils
+        target=nvidia-470xx-dkms
         nvidia_hook=1
     elif lspci | grep -Eiq '(VGA|3D).*NVIDIA.*GTX? ([45][0-9]{2}|6[0-9]{2}M)'; then
         aur_install nvidia-390xx-dkms nvidia-390xx-utils nvidia-390xx-settings lib32-nvidia-390xx-utils
+        target=nvidia-390xx-dkms
         nvidia_hook=1
     elif lspci | grep -Eiq '(VGA|3D).*NVIDIA.*GT?X? ?[123][0-9]{2}[^0]'; then
         aur_install nvidia-340xx-dkms nvidia-340xx-utils nvidia-340xx-settings lib32-nvidia-340xx-utils
         echo "ACTION==\"add\", DEVPATH==\"/bus/pci/drivers/nvidia\", RUN+=\"/usr/bin/nvidia-modprobe -c 0 -u\"" > /etc/udev/rules.d/70-nvidia.rules
+        target=nvidia-340xx-dkms
         nvidia_hook=1
     fi
     if [[ $nvidia_hook ]]; then
@@ -2449,7 +2452,7 @@ Operation = Install
 Operation = Upgrade
 Operation = Remove
 Type = Package
-Target = nvidia-dkms
+Target = $target
 
 [Action]
 Description = Update NVIDIA module in initcpio
@@ -2458,7 +2461,7 @@ When = PostTransaction
 NeedsTargets
 Exec = /bin/sh -c 'while read -r trg; do case \$trg in linux|linux-lts|linux-hardened|linux-rt|linux-rt-lts|linux-zen) exit 0; esac; done; /usr/bin/mkinitcpio -P'" > "$f"
         for k in "${KERNEL[@]}"; do 
-            sed -i "/^Target = nvidia/a Target = $k" "$f"
+            sed -i "/^Target = $target/a Target = $k" "$f"
         done
     fi
 }
