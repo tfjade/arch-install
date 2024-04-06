@@ -1151,7 +1151,7 @@ install_gnome() {
     gsettings set org.gnome.desktop.interface gtk-theme Adwaita-dark
     gsettings set org.gnome.shell disable-user-extensions false
     # fix kitty on gnome wayland
-    [[ -e ~/.config/kitty/kitty.conf ]] && sed -i '/linux_display_server auto/a linux_display_server x11' ~/.config/kitty/kitty.conf
+    [[ -e ~/.config/kitty/kitty.conf ]] && sed -i '/linux_display_server x11/s/^#//' ~/.config/kitty/kitty.conf
     
 
     # GDM is by default the display manager in Gnome
