@@ -2666,9 +2666,7 @@ inside_chroot() {
 
     # Set some sysctl values
     echo \
-"# Increase the number of virtual memory areas that one process may request
-vm.max_map_count=$((2**20))
-# Decrease tendency to use swap
+"# Decrease tendency to use swap
 vm.swappiness=5" > /etc/sysctl.d/99-sysctl.conf
 
     # Set reflector default args. Please, verify these settings before starting the reflector service or timer
