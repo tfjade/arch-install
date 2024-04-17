@@ -1102,7 +1102,7 @@ install_cinnamon() {
 install_plasma() {
     local k
     set -e
-    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps plasma-meta plasma-workspace xdg-desktop-portal-kde kde-gtk-config packagekit-qt5 konsole dolphin kate okular plasma-nm kdeplasma-addons kcharselect cryfs encfs gocryptfs kdialog spectacle partitionmanager filelight
+    sudo pacman -Sq --noconfirm --needed xorg-server xorg-apps plasma-meta plasma-workspace xdg-desktop-portal-kde kde-gtk-config packagekit-qt6 konsole dolphin kate okular plasma-nm kdeplasma-addons kcharselect cryfs encfs gocryptfs kdialog spectacle partitionmanager filelight
    
     if [[ $SAMBA ]] || [[ -s /etc/samba/smb.conf ]]; then
         sudo pacman -Sq --noconfirm --needed kdenetwork-filesharing
