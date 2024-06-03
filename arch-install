@@ -808,9 +808,9 @@ clear_partitions() {
     if (( ${#parts[@]} > 1 )) || [[ $VGPART ]]; then
         echo
         lsblk -f "$DISK"
-        [[ $YES ]] || echo -e "\nNothing has been altered on disk $DISK yet.\nTo abort installation to disk $DISK, press Ctrl-C now, or answer No."
-        [[ $YES ]] || read -r -p "Scan partitions on $DISK [Y/n]? "
-        if [[ $YES ]] || ! [[ ${REPLY,,} =~ ^no? ]]; then
+        [[ $YES || $KEEP_PARTITIONS ]] || echo -e "\nNothing has been altered on disk $DISK yet.\nTo abort installation to disk $DISK, press Ctrl-C now, or answer No."
+        [[ $YES || $KEEP_PARTITIONS ]] || read -r -p "Scan partitions on $DISK [Y/n]? "
+        if [[ $YES || $KEEP_PARTITIONS ]] || ! [[ ${REPLY,,} =~ ^no? ]]; then
             # To wipe volumes, they need to be unmounted
             mount | grep -qF /mnt && umount -R /mnt
 
@@ -836,7 +836,7 @@ clear_partitions() {
             for i in "${parts[@]}"; do ! is_saved "$i" && wipefs -aqf "$i" && echo "Wiped $i" || echo "Skipped wiping $i"; done
             unset BOOTP
             partprobe "$DISK"
-        else
+        elif [[ -z $KEEP_PARTITIONS ]]; then
             # Since the disk contains data, and you answered not to scan partitions,
             # installing cannot continue.
             echo -e "\nAborting install.\nDisk $DISK contains partitions or volumes, which must be scanned to continue."
@@ -2775,6 +2775,7 @@ custom_conf() {
     CUSTOM_CONF+=("${conf[@]}")
 }
 
+# parse comma (,) separated options from the cli -o,--option
 parse_cli_option() {
     local arr opt tmp_file
     IFS=',' read -r -a arr <<< "$1"
@@ -2787,11 +2788,23 @@ parse_cli_option() {
     return 0
 }
 
+# parse comma (,) separated list of partitions from the cli -k,--keep-partition
+# and preserve those partitions
+keep_partitions() {
+    local arr p
+    IFS=',' read -r -a arr <<< "$1"
+    for p in "${arr[@]}"; do
+        [[ $p =~ ^/dev/ ]] || p="/dev/${p#/}"
+        [[ -b "$p" ]] && save_with_parents "$p" && KEEP_PARTITIONS="yes"
+    done
+    return 0
+}
+
 # check options, read all custom conf files, and start reflector in the background, 
 # unless user chooses not to run reflector (-n)
 check_options() {
     local args country
-    if ! args=$(getopt -o c:e:i:o:R:H:hny -l conf:,option:,efi:,root:,home:,country:,no-reflector,help,yes -- "$@"); then
+    if ! args=$(getopt -o c:e:i:o:R:H:k:hny -l conf:,option:,efi:,root:,home:,keep-partition:,country:,no-reflector,help,yes -- "$@"); then
         echo -e "Check options: $*"
         exit 1
     fi
@@ -2800,7 +2813,7 @@ check_options() {
     while [[ $1 ]]; do
       case "$1" in
         -n|--no-reflector)
-                    SKIP_REFLECTOR=yes; shift
+                    SKIP_REFLECTOR="yes"; shift
                     ;;
              -c|--country)
                     country="$2"; shift 2
@@ -2810,6 +2823,9 @@ check_options() {
                     ;;
               -o|--option)
                     parse_cli_option "$2" && shift 2 || { echo "Error: Cannot parse option '$2'"; exit 1; }
+                    ;;
+      -k|--keep-partition)
+                    [[ -b "${2%%,*}" || -b "/dev/${2%%,*}" ]] && keep_partitions "$2" && shift 2 || { echo "Error: Option $1 must be followed by a valid partition path."; exit 1; }
                     ;;
                  -E|--efi)
                     [[ -b "$2" ]] && ESP="$2" && save_with_parents "$2" && shift 2 || { echo "Error: Option $1 must be followed by a valid esp partition path."; exit 1; }
@@ -2821,9 +2837,9 @@ check_options() {
                     [[ -b "$2" ]] && HOME_PARTITION="$2" && save_with_parents "$2" && shift 2 || { echo "Error: Option $1 must be followed by a valid home partition path."; exit 1; }
                     ;;
                 -y|--yes)
-                     YES=yes; shift
+                     YES="yes"; shift
                      ;;
-                -h|--help)
+               -h|--help)
                     echo -e \
 "
 Usage: $(basename "$0") [options]
@@ -2847,11 +2863,11 @@ options:
         Optionally specify the <country> to use when reflector is ranking mirrors.
         Normally the country you are in should be detected by http://ip-api.com.
         You may specify multiple countries separated by commas (,).
-    
+
     -E, --efi <partition>
         Optionally specify the partition to use as the esp i.e. EFI partition.
         This is obviously only for EFI systems. Legacy MBR systems don't use this.
-        
+
     -H, --home <partition>
         Optionally specify the <partition> to use as the home partition of the 
         new installation. If you have an old home disk or partition, this is a
@@ -2864,6 +2880,13 @@ options:
         Optionally specify the <partition> or <disk> to use for the target root
         partition of the new installation. This partition will be formatted.
         Warning! Don't use this, unless you are absolutely sure it is needed.
+
+    -k, --keep-partition <partition>
+        By default all extra partitions will be deleted from from the target disk
+        to free disk space for the install. Use this option to preserve <partition>
+        when you e.g. intend to multiboot. The <partition> can be a comma (,)
+        separated list of multiple partitions.
+        Warning: the install will fail, if there isn't enough free space on the disk.
 
     -y, --yes
         Answer the default automatically to \"safe\" questions.
