@@ -848,12 +848,20 @@ clear_partitions() {
 # If disk is a new/empty NVMe SSD, check LBA Formats and select 4096 bytes (2^12) LBA
 # instead of 512 (2^9), if available. Tested on WD Black SN750 and SN850 M.2 SSD.
 optimize_nvme_lba() {
-    local lbaf
-    # be sure disk is nvme and empty, or return
-    [[ $DISK =~ ^/dev/nvme ]] && [[ $(lsblk -no path "$DISK" | wc -l) -eq 1 ]] || return
-    # Searching for the best relative performance i.e. lowest rp:
-    lbaf=$(nvme id-ns "$DISK" | awk '/in use/ && $1=="lbaf" {u=$2} $1=="lbaf" {split($6,t,":"); rp=strtonum(t[2])} !m || rp<m {m=rp; f=$2} END {if(f!=u) print f}')
-    [[ $lbaf ]] && nvme format --lbaf="$lbaf" "$DISK"
+    local arr i lbaf in_use rp min_rp f
+    # be sure disk is nvme and empty, and this is an EFI system, or return
+    [[ $DISK =~ ^/dev/nvme ]] && [[ $(lsblk -no path "$DISK" | wc -l) -eq 1 ]] && is_efi || return
+    readarray -t arr < <(nvme id-ns "$DISK" | grep -w '^lbaf')
+    # Searching for best relative performance i.e. lowest rp:
+    for i in "${arr[@]}"; do
+        lbaf="$(awk '{print $2}' <<< "$i")"
+        [[ $i =~ in\ use ]] && in_use="$lbaf"
+        rp="$(sed -E 's/.* rp:(0x)?([0-9]*).*/\2/' <<< "$i")"
+        [[ $min_rp ]] || min_rp="$rp"
+        ((rp<min_rp)) && min_rp="$rp" && f="$lbaf"
+    done
+    [[ $in_use ]] || in_use="$f"
+    [[ $f ]] && ((f!=in_use)) && nvme format --lbaf="$f" "$DISK"
 }
 
 # Create btrfs subvols on dev $1 or ROOTP, which must be btrfs formatted.
