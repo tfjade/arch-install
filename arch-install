@@ -2368,7 +2368,7 @@ or other application using the libvirt API.
 <permissions>
   <mode>0770</mode>
   <owner>0</owner>
-  <group>$(grep "libvirt:" /etc/group | cut -d: -f3)</group>
+  <group>$(awk -F: '/^libvirt:/ {print $3}' /etc/group)</group>
 </permissions>
 </target>
 </pool>" > /etc/libvirt/storage/default.xml
