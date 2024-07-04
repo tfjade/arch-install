@@ -1140,14 +1140,14 @@ prepare_disk() {
     if [[ $BTRFS ]]; then
         create_btrfs_subvols "$ROOTP" /mnt
     else
-        mount "$ROOTP" /mnt
+        mount -o noatime "$ROOTP" /mnt
     fi
 
     # Mounting /boot, almost never needed
     if [[ $BOOTP ]]; then
         echo "Mounting /mnt/boot"
         install -d /mnt/boot
-        mount "$BOOTP" /mnt/boot
+        mount -o noatime "$BOOTP" /mnt/boot
         [[ $EFI ]] || EFI=/boot/efi
     fi
 
@@ -1156,7 +1156,7 @@ prepare_disk() {
         [[ $EFI ]] || EFI=/boot
         echo "Mounting esp /mnt/${EFI#/}"
         install -d "/mnt/${EFI#/}"
-        mount -o fmask=0137,dmask=0027,gid="$(grep "^wheel:" /etc/group | cut -d: -f3)" "$ESP" "/mnt/${EFI#/}"
+        mount -o noatime,fmask=0137,dmask=0027,gid="$(awk '/^wheel:/ {print $3}' /etc/group)" "$ESP" "/mnt/${EFI#/}"
     fi
 
     # If home partition, and nothing (i.e. subvolume @home) is mounted to /mnt/home
@@ -1164,7 +1164,7 @@ prepare_disk() {
         echo "Mounting /mnt/home"
         install -d /mnt/home
         detect_btrfs "$HOME_PARTITION" && home_mo=(-o "noatime,compress=zstd") || home_mo=()
-        mount "${home_mo[@]}" "$HOME_PARTITION" /mnt/home
+        mount -o noatime "${home_mo[@]}" "$HOME_PARTITION" /mnt/home
     fi
 
     # Mounting swap (if present)
