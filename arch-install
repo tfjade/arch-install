@@ -1008,7 +1008,7 @@ generate_fstab() {
         # fix mount options for /swap and /var. Not effective now, but should be in the future
         sed -Ei '/(\/swap|\/var)\s/s/(noatime).*(subvol=)/\1,nodatacow,\2/' "$target"/etc/fstab
         # add bind mount for /var/lib
-        echo -e "# /var/lib to /usr/var/lib on subvol=/@\n/usr/var/lib\t\t/var/lib\tnone\t\tbind\t0 0\n" >> "$target"/etc/fstab
+        [[ -d "$target"/usr/var/lib ]] && echo -e "# /var/lib to /usr/var/lib on subvol=/@\n/usr/var/lib\t\t/var/lib\tnone\t\tbind\t0 0\n" >> "$target"/etc/fstab
     fi
 }
 
