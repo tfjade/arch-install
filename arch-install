@@ -887,7 +887,7 @@ create_btrfs_subvols() {
 
     # On kernel 6.2+ discard=async is the default
     mo_ssd="noatime,ssd,compress=zstd:1"
-    mo_hdd="${mo_ssd/,ssd/,autodefrag}" # spinning drive, autodefrag
+    mo_hdd="${mo_ssd/',ssd'/',autodefrag'}" # spinning drive, autodefrag
     detect_ssd "$DISK" && mo="$mo_ssd" || mo="$mo_hdd"
 
     # mount root
@@ -943,6 +943,32 @@ create_btrfs_subvols() {
     fi
 }
 
+create_bcachefs_subvols() {
+    local dev target home_fstype home_mo
+    dev="$ROOTP"
+    target="/mnt"
+    [[ -b "$1" ]] && dev="$1"
+    [[ -d "$2" ]] && target="$2"
+    (($#)) && shift $#
+
+    [[ -b "$dev" ]] || { echo "Error: Need a bcachefs formatted device (ROOTP) to create subvolumes on."; exit 1; }
+    blkid -s TYPE -o value "$dev" | grep -qx bcachefs || { echo "Error: $dev must be bcachefs formatted."; exit 1; }
+    findmnt -n "$target" | grep -qw "$dev" || mount -t bcachefs "$dev" "$target"
+
+    if [[ -b $HOME_PARTITION ]]; then
+        # /home is on another partition/volume
+        home_fstype="$(detect_fs "$HOME_PARTITION")"
+        home_fstype="${home_fstype:-bcachefs}"
+        [[ $home_fstype == "bcachefs" ]] && home_mo=(-t "$home_fstype")
+        mount "${home_mo[@]}" "$HOME_PARTITION" "$target"/home
+    else
+        #bcachefs subvolume create "$target"/home
+        echo
+    fi
+    #[[ -d "$target"/var ]] || install -dm755 "$target"/var
+    #bcachefs subvolume create --nocow "$target"/var/log
+}
+
 create_lvm() {
     local volname
     pvcreate -Z y -y --dataalignment 1M "$VGPART"
@@ -979,6 +1005,7 @@ initial_pacstrap() {
     for k in "${KERNEL[@]}"; do PKGLIST+=("$k" "$k-headers"); done
     (($(vgs --noheadings | wc -l))) && PKGLIST+=(lvm2)
     (($(findmnt -nt btrfs | wc -l))) && PKGLIST+=(btrfs-progs)
+    (($(findmnt -nt bcachefs | wc -l))) && PKGLIST+=(bcachefs-tools)
     if ! systemd-detect-virt -q; then  # virtual machines don't need ucode(?)
         grep -wq GenuineIntel /proc/cpuinfo && PKGLIST+=(intel-ucode)
         grep -wq AuthenticAMD /proc/cpuinfo && PKGLIST+=(amd-ucode)
@@ -1120,8 +1147,13 @@ prepare_disk() {
     if [[ $BTRFS ]]; then
         (($(btrfs --version | tr -dc '0-9' | cut -c-2) > 62)) || pacman -Sq --noconfirm btrfs-progs
         fm=(mkfs.btrfs -f --quiet)
+    elif [[ $BCACHEFS ]]; then
+        [[ -e /usr/bin/bcachefs ]] || pacman -Sq --noconfirm bcachefs-tools
+        fm=(bcachefs format '--compression=lz4')
     else
         fm=(mkfs.ext4 -FF -m 1)
+        [[ $FAST_COMMIT ]] && fm+=(-O fast_commit)
+        [[ $NO_HAS_JOURNAL ]] && fm+=(-O '^has_journal')
     fi
     "${fm[@]}" -L ROOT "$ROOTP"
 
@@ -1139,6 +1171,8 @@ prepare_disk() {
     # Mounting root
     if [[ $BTRFS ]]; then
         create_btrfs_subvols "$ROOTP" /mnt
+    elif [[ $BCACHEFS ]]; then
+        create_bcachefs_subvols "$ROOTP" /mnt
     else
         mount -o noatime "$ROOTP" /mnt
     fi
@@ -2727,7 +2761,11 @@ validate_conf() {
     SET_SSH_KEY_PASSWORD="$(validate "$SET_SSH_KEY_PASSWORD")"
     SECURE_BOOT="$(validate "$SECURE_BOOT")"
     ENCRYPT="$(validate "$ENCRYPT")"
+    FAST_COMMIT="$(validate "$FAST_COMMIT")"
+    NO_HAS_JOURNAL="$(validate "$NO_HAS_JOURNAL")"
     BTRFS="$(validate "$BTRFS")"
+    [[ $BTRFS ]] && unset BCACHEFS
+    BCACHEFS="$(validate "$BCACHEFS")"
     SYSTEMD_HOMED="$(validate "$SYSTEMD_HOMED")"
     SYSTEMD_NETWORKD="$(validate "$SYSTEMD_NETWORKD")"
     HOME_PARTITION="$(validate "$HOME_PARTITION")"
@@ -2741,13 +2779,18 @@ validate_conf() {
     [[ $HOME_PARTITION ]] && ROOT_SIZE=${ROOT_SIZE:-"50%"}
     [[ $ROOT_SIZE ]] && validate_root_size
     [[ $SWAP_SIZE ]] && validate_swap_size
+    # bcachefs doesn't support swapfile
+    [[ $BCACHEFS ]] && [[ -z $SWAP_PARTITION ]] && (( SWAP_SIZE > 0 )) && unset SWAP_SIZE
+
     # On EFI system, where to mount the EFI esp, /boot, /boot/efi or /efi?
     # If Grub with encryption, a separate boot partition is created for /boot,
     # if the EFI esp is something else than /boot
     EFI="${EFI:-"/efi"}"
+
     # If encryption is selected, default luks2 encryption volume name is "cryptvol".
     # You may change this according to taste. It could be e.g. "cryptroot"
     CRYPTVOL_NAME="${CRYPTVOL_NAME:-"cryptvol"}"
+
     return 0
 }
 
