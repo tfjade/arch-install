@@ -996,6 +996,88 @@ create_lvm() {
     vgchange -ay
 }
 
+prepare_dracut() {
+    local target
+    target="$1"
+    f="$target"/etc/dracut.conf.d/10-defaults.conf
+    [[ -d "$(dirname "$f")" ]] || mkdir -p "$(dirname "$f")"
+    cat > "$f" <<EOF
+hostonly="yes"
+compress="zstd -6 --long"
+omit_dracutmodules+=" network "
+EOF
+    {
+    in_list "${PKGLIST[*]}" -- "lvm2" && echo 'add_dracutmodules+=" lvm "'
+    in_list "${PKGLIST[*]}" -- "btrfs-progs" && echo 'add_dracutmodules+=" btrfs "'
+    } >> "$f"
+
+    f="$target"/usr/local/bin/dracut-install.sh
+    [[ -d "$(dirname "$f")" ]] || mkdir -p "$(dirname "$f")"
+    cat > "$f" <<EOF
+#!/usr/bin/env bash
+
+args=('--force' '--no-hostonly-cmdline')
+
+while read -r line; do
+    if [[ "\$line" == 'usr/lib/modules/'+([^/])'/pkgbase' ]]; then
+        read -r pkgbase < "/\${line}"
+        kver="\${line#'usr/lib/modules/'}"
+        kver="\${kver%'/pkgbase'}"
+
+        install -Dm644 "/\${line%'/pkgbase'}/vmlinuz" "/boot/vmlinuz-\${pkgbase}"
+        dracut "\${args[@]}" --hostonly "/boot/initramfs-\${pkgbase}.img" --kver "\$kver"
+        dracut "\${args[@]}" --no-hostonly "/boot/initramfs-\${pkgbase}-fallback.img" --kver "\$kver"
+    fi
+done
+EOF
+    chmod +x "$f"
+
+    f="$target"/usr/local/bin/dracut-remove.sh
+    cat > "$f" <<EOF
+#!/usr/bin/env bash
+
+while read -r line; do
+    if [[ "\$line" == 'usr/lib/modules/'+([^/])'/pkgbase' ]]; then
+        read -r pkgbase < "/\${line}"
+        rm -f "/boot/vmlinuz-\${pkgbase}" "/boot/initramfs-\${pkgbase}.img" "/boot/initramfs-\${pkgbase}-fallback.img"
+    fi
+done
+EOF
+    chmod +x "$f"
+
+    f="$target"/etc/pacman.d/hooks/90-dracut-install.hook
+    [[ -d "$(dirname "$f")" ]] || mkdir -p "$(dirname "$f")"
+    cat > "$f" <<EOF
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = usr/lib/modules/*/pkgbase
+
+[Action]
+Description = Updating linux initcpios (with dracut!)...
+When = PostTransaction
+Exec = /usr/local/bin/dracut-install.sh
+Depends = dracut
+NeedsTargets
+EOF
+
+    f="$target"/etc/pacman.d/hooks/60-dracut-remove.hook
+cat > "$f" <<EOF
+[Trigger]
+Type = Path
+Operation = Remove
+Target = usr/lib/modules/*/pkgbase
+
+[Action]
+Description = Removing linux initcpios...
+When = PreTransaction
+Exec = /usr/local/bin/dracut-remove.sh
+NeedsTargets
+EOF
+
+}
+
 initial_pacstrap() {
     local k target
     target="/mnt"
@@ -1013,12 +1095,15 @@ initial_pacstrap() {
     # install dbus-broker
     PKGLIST+=(dbus-broker-units)
     
-    # mkinitcpio MUST be installed (not e.g. dracut), because mkinitcpio is building the Unified Kernel Image on EFI systems.
-    pacstrap -K "$target" base "${PKGLIST[@]}" linux-firmware base-devel mkinitcpio openssh nano vim git mtools dosfstools iptables-nft ||
+    # mkinitcpio OR dracut, both can build the Unified Kernel Image on EFI systems.
+    # mkinitcpio is the default in Arch Linux.
+    [[ $DRACUT ]] && PKGLIST+=(dracut) && prepare_dracut "$target" || PKGLIST+=(mkinitcpio)
+
+    pacstrap -K "$target" base "${PKGLIST[@]}" linux-firmware base-devel openssh nano vim git mtools dosfstools iptables-nft ||
       { echo -e "Error: pacstrap failed. Check the packages.\n       PKGLIST contains ${#PKGLIST[*]} packages: ${PKGLIST[*]}"; exit 1; }
     
     # mkinitcpio.conf doesn't exist before pacstrap
-    in_list "${PKGLIST[*]}" -- "lvm2" && sed -i '/^HOOKS=/s/filesystems/lvm2 &/' "$target"/etc/mkinitcpio.conf
+    in_list "${PKGLIST[*]}" -- "lvm2" && in_list "${PKGLIST[*]}" -- "mkinitcpio" && sed -i '/^HOOKS=/s/filesystems/lvm2 &/' "$target"/etc/mkinitcpio.conf
 }
 
 generate_fstab() {
@@ -1190,7 +1275,7 @@ prepare_disk() {
         [[ $EFI ]] || EFI=/boot
         echo "Mounting esp /mnt/${EFI#/}"
         install -d "/mnt/${EFI#/}"
-        mount -o noatime,fmask=0137,dmask=0027,gid="$(awk '/^wheel:/ {print $3}' /etc/group)" "$ESP" "/mnt/${EFI#/}"
+        mount -o noatime "$ESP" "/mnt/${EFI#/}"
     fi
 
     # If home partition, and nothing (i.e. subvolume @home) is mounted to /mnt/home
@@ -1285,10 +1370,10 @@ Exec = /usr/local/bin/sbctl-sign" > "$f"
     fi
 }
 
-# Configure the system to use Unified Kernel Image with mkinitcpio.
+# Configure the system to use Unified Kernel Image.
 # Systemd-boot, rEFInd and EFISTUB use this, if esp is not mounted to /boot
 unified_kernel_image() {
-    local efi opt quiet secboot ed preset
+    local efi opt quiet secboot ed preset f i kver
 
     while [[ $1 ]]; do
       case "$1" in
@@ -1309,23 +1394,37 @@ unified_kernel_image() {
     done
     [[ -d "$efi" && $efi != /boot ]] || return 1
     [[ $opt ]] && echo "${opt}" > /etc/kernel/cmdline
-    ed="$(sed -En '/default_uki=/s,.*"/efi/(.*)/.*,\1,p' /etc/mkinitcpio.d/"${KERNEL[0]}".preset)"
-    : "${ed:="EFI/Linux"}"
-    mkdir -p "$efi/${ed}"
+    if [[ -d /etc/mkinitcpio.d ]]; then
+        ed="$(sed -En '/default_uki=/s,.*"/efi/(.*)/.*,\1,p' /etc/mkinitcpio.d/"${KERNEL[0]}".preset)"
+        : "${ed:="EFI/Linux"}"
+        mkdir -p "$efi/${ed}"
 
-    for preset in /etc/mkinitcpio.d/*.preset; do
-        sed -i "2a # Directory where the esp is mounted\nESP_DIR=\"${efi}\"\n" "$preset"
-        sed -i '/_uki=/s/^#//' "$preset"
-        sed -i "/_uki=/s,=\".*/,=\"\${ESP_DIR}/${ed}/," "$preset"
-        [[ -e /etc/cmdline.d/quiet.conf ]] && sed -i '/default_options=/s/^#//' "$preset" # splash screen
-    done
-    mkinitcpio -P
+        for preset in /etc/mkinitcpio.d/*.preset; do
+            sed -i "2a # Directory where the esp is mounted\nESP_DIR=\"${efi}\"\n" "$preset"
+            sed -i '/_uki=/s/^#//' "$preset"
+            sed -i "/_uki=/s,=\".*/,=\"\${ESP_DIR}/${ed}/," "$preset"
+            [[ -e /etc/cmdline.d/quiet.conf ]] && sed -i '/default_options=/s/^#//' "$preset" # splash screen
+        done
+        mkinitcpio -P
+    elif [[ -d /etc/dracut.conf.d ]]; then
+        f=/etc/dracut.conf.d/10-defaults.conf
+        echo \
+"uefi=\"yes\"
+machine_id=\"no\"
+uefi_splash_image=\"/usr/share/systemd/bootctl/splash-arch.bmp\"" >> "$f"
+        i=0
+        for kver in $(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d); do
+            dracut --kver="${kver##*/}" --force
+            ((++i == 1)) && DEFAULT_UKI="$(find "$efi"/EFI/Linux -name "*.efi"|grep -v fallback)" && DEFAULT_UKI="${DEFAULT_UKI##*/}"
+        done
+    fi
 }
 
 # Handle /etc/mkinitcpio.conf HOOKS when the rootfs is encrypted,
 # and 'udev' is in the HOOKS
 _encrypted_boot_udev() {
-    sed -i "/^HOOKS=/s/block/encrypt &/" /etc/mkinitcpio.conf
+    [[ -e /etc/mkinitcpio.conf ]] && sed -i "/^HOOKS=/s/block/encrypt &/" /etc/mkinitcpio.conf
+    [[ -e /etc/dracut.conf.d/10-defaults.conf ]] && echo 'add_dracutmodules+=" crypt "' >> /etc/dracut.conf.d/10-defaults.conf
 }
 
 # Handle /etc/mkinitcpio.conf HOOKS when the rootfs is encrypted,
@@ -1342,9 +1441,13 @@ _encrypted_boot_systemd() {
                       *) shift;;
       esac
     done
-    sed -i '/^HOOKS=/s/udev /systemd /' /etc/mkinitcpio.conf
-    sed -i '/^HOOKS=/s/keymap consolefont/sd-vconsole/' /etc/mkinitcpio.conf
-    sed -i "/^HOOKS=/s/block/sd-encrypt &/" /etc/mkinitcpio.conf
+    if [[ -e /etc/mkinitcpio.conf ]]; then
+        sed -i '/^HOOKS=/s/udev /systemd /' /etc/mkinitcpio.conf
+        sed -i '/^HOOKS=/s/keymap consolefont/sd-vconsole/' /etc/mkinitcpio.conf
+        sed -i "/^HOOKS=/s/block/sd-encrypt &/" /etc/mkinitcpio.conf
+    elif [[ -e /etc/dracut.conf.d/10-defaults.conf ]]; then
+        echo 'add_dracutmodules+=" systemd-cryptsetup "' >> /etc/dracut.conf.d/10-defaults.conf
+    fi
     detect_ssd "$disk" && discard="discard" || discard=""
     [[ -n "$cryptname" ]] && [[ -n "$uuid" ]] &&
       echo "${cryptname}  UUID=${uuid}  -  ${discard}" >> /etc/crypttab.initramfs &&
@@ -1404,7 +1507,7 @@ _install_systemd-boot() {
     if [[ $ep ]]; then
         # Unified Kernel Image is necessary since $efi is not /boot
         unified_kernel_image --efi "$efi" "$quiet" ${secboot:+-s} --
-        sed -i "/^default /s/ .*/ arch-${KERNEL[0]}.efi/" "$efi/loader/loader.conf"
+        sed -i "/^default /s/ .*/ ${DEFAULT_UKI:-arch-${KERNEL[0]}.efi}/" "$efi/loader/loader.conf"
         [[ ! -e "${efi}${ep}/vmlinuz-${KERNEL[0]}" || ! -e "${efi}${ep}/initramfs-${KERNEL[0]}.img" ]] && sed -i 's/^/#/' "$entry"
         # This entry wouldn't work unless the kernel, initramfs and ucodes were copied to the esp.
         # Also, the entry is not needed with the Unified Kernel Image.
@@ -1478,8 +1581,8 @@ _install_refind() {
     if [[ $efi != /boot ]]; then
         echo "${opt[*]}" > /etc/cmdline.d/root.conf
         unified_kernel_image --efi "$efi" "$quiet" ${secboot:+-s} --
-        cp /usr/share/refind/icons/os_arch.png "${efi}/EFI/Linux/arch-${KERNEL[0]}.png"
-        cp /usr/share/refind/icons/os_arch.png "${efi}/EFI/Linux/arch-${KERNEL[0]}-fallback.png"
+        cp /usr/share/refind/icons/os_arch.png "${efi}/EFI/Linux/${DEFAULT_UKI:-arch-${KERNEL[0]}.png}"
+        cp /usr/share/refind/icons/os_arch.png "${efi}/EFI/Linux/${DEFAULT_UKI:-arch-${KERNEL[0]}-fallback.png}"
         detect_btrfs && b="$(btrfs_root_subvol)"\\boot
     fi
 
@@ -1567,7 +1670,7 @@ _install_efistub() {
     else
         echo "${opt[*]}" > /etc/cmdline.d/root.conf
         unified_kernel_image --efi "$efi" "$quiet" ${secboot:+-s} --
-        ldr="/EFI/Linux/arch-${KERNEL[0]}.efi"
+        ldr="/EFI/Linux/${DEFAULT_UKI:-arch-${KERNEL[0]}.efi}"
         options=""
     fi
     # If boot problems with EFISTUB, boot into EFI Shell, and issue command:
@@ -2439,13 +2542,15 @@ install_intel_gpu_driver() {
     pacman -Sq --noconfirm --needed "${PKGLIST[@]}" mesa-utils mesa-vdpau \
         libva-mesa-driver libva-utils intel-media-sdk intel-gpu-tools
     # You may want to add i915 to MODULES in /etc/mkinitcpio.conf
-    sed -i '/^MODULES=/s/)/ i915)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+    [[ -e /etc/mkinitcpio.conf ]] && sed -i '/^MODULES=/s/)/ i915)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+    [[ -d /etc/dracut.conf.d ]] && echo 'add_drivers+=" i915 "' > /etc/dracut.conf.d/20-i915.conf && dracut
 }
 
 install_amdgpu_driver() {
     pacman -Sq --noconfirm --needed mesa xf86-video-amdgpu mesa-utils \
         vulkan-radeon libva-mesa-driver libva-utils mesa-vdpau radeontop
-    sed -i '/^MODULES=/s/)/ amdgpu)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+    [[ -e /etc/mkinitcpio.conf ]] && sed -i '/^MODULES=/s/)/ amdgpu)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+    [[ -d /etc/dracut.conf.d ]] && echo 'add_drivers+=" amdgpu "' > /etc/dracut.conf.d/20-amdgpu.conf && dracut
     # Linux AMDGPU Control Application is in the AUR
     aur_install lact
     systemctl enable lactd
@@ -2455,7 +2560,8 @@ nvidia_boot_settings() {
     # if already done, nothing to do
     grep -q '^MODULES=.*nvidia' /etc/mkinitcpio.conf && return
     echo "nvidia-drm.modeset=1" > /etc/cmdline.d/nvidia.conf
-    sed -i '/^HOOKS=/s/ kms / /;/^MODULES=/s/)/ nvidia nvidia_modeset nvidia_uvm nvidia_drm)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+    [[ -e /etc/mkinitcpio.conf ]] && sed -i '/^HOOKS=/s/ kms / /;/^MODULES=/s/)/ nvidia nvidia_modeset nvidia_uvm nvidia_drm)/;s/( /(/' /etc/mkinitcpio.conf && mkinitcpio -P
+    [[ -d /etc/dracut.conf.d ]] && echo 'force_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "' > /etc/dracut.conf.d/20-nvidia.conf && dracut
 }
 
 # AUR is needed for older model Nvidia GPU drivers. THESE MAY OR MAY NOT WORK.
@@ -2499,6 +2605,7 @@ Exec = /bin/sh -c 'while read -r trg; do case \$trg in ) exit 0; esac; done; /us
         for k in "${KERNEL[@]}"; do
             sed -Ei "/Exec =/s/([^ ])\)/\1|$k)/;/Exec =/s/ \)/ $k)/;/^Target = $target/a Target = $k" "$f"
         done
+        [[ -d /etc/dracut.conf.d ]] && sed -Ei 's/mkinitcpio( -P)?/dracut/' "$f" # assume dracut
     fi
 }
 
@@ -2708,7 +2815,13 @@ vm.swappiness=5" > /etc/sysctl.d/99-sysctl.conf
     # Set reflector default args. Please, verify these settings before starting the reflector service or timer
     f=/etc/xdg/reflector/reflector.conf
     [[ -e "$f" ]] && sed -i "/^# --country/a --country $(curl -s http://ip-api.com/line?fields=country)" "$f" &&
-      sed -i 's/^--sort /# &/;/^# --sort/a # Sort by download speed\n--sort rate' "$f"    
+      sed -i 's/^--sort /# &/;/^# --sort/a # Sort by download speed\n--sort rate' "$f"
+
+    # If dracut, need to force the creation of the initramfs
+    [[ $DRACUT ]] && for kver in $(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d); do
+        dracut --kver="${kver##*/}" --force
+    done
+
 } # inside_chroot() function ends
 
 ########################################################################
@@ -2756,6 +2869,7 @@ validate_conf() {
     [[ $UNAME == "root" ]] && unset UNAME
     declare -p KERNEL | grep -q 'declare -a' || KERNEL=("$KERNEL")
     (( ${#KERNEL[*]} )) || KERNEL=(linux)
+    DRACUT="$(validate "$DRACUT")"
     LOCK_ROOT_ACCOUNT="$(validate "$LOCK_ROOT_ACCOUNT")"
     SWAP_PARTITION="$(validate "$SWAP_PARTITION")"
     SET_SSH_KEY_PASSWORD="$(validate "$SET_SSH_KEY_PASSWORD")"
