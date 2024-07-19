@@ -2476,6 +2476,9 @@ install_qemu() {
         # enable libvirtd and cockpit (i.e. localhost:9090)
         systemctl enable libvirtd.socket cockpit.socket pmcd pmlogger
 
+        # If firewall ufw is enabled, networking will fail in libvirt VM's, unless firewall_backend = "iptables"
+        sed -Ei 's/^[# ]*(firewall_backend) = "[^"]*/\1 = "iptables/' /etc/libvirt/network.conf
+
         if detect_btrfs; then
             # On btrfs /var/lib/libvirt/images would be included in root snapshots,
             # and vm images would be waste of space in those snapshots.
