@@ -1019,23 +1019,24 @@ install_sddm() {
     [[ -e /etc/sddm.conf.d/kde_settings.conf ]] && k=/etc/sddm.conf.d/kde_settings.conf
 
     # sugar-candy theme:
-    sudo pacman -Sq --noconfirm --needed qt5-graphicaleffects qt5-quickcontrols qt5-svg
-    if install_aur_pkg -q sddm-sugar-candy-git; then
-        [[ $k ]] && sudo sed -i '/\[Theme\]/,/^$/s/Current=.*/Current=sugar-candy/' "$k" ||
-        { [[ ! -s /etc/sddm.conf.d/theme.conf ]] && echo -e "[Theme]\nCurrent=sugar-candy\n# Check sugar-candy settings: https://store.kde.org/p/1312658/" | sudo tee /etc/sddm.conf.d/theme.conf > /dev/null; }
-    elif install_aur_pkg -q sddm-theme-sugar-candy-git; then
-        [[ $k ]] && sudo sed -i '/\[Theme\]/,/^$/s/Current=.*/Current=Sugar-Candy/' "$k" ||
-        { [[ ! -s /etc/sddm.conf.d/theme.conf ]] && echo -e "[Theme]\nCurrent=Sugar-Candy\n# Check sugar-candy settings: https://store.kde.org/p/1312658/" | sudo tee /etc/sddm.conf.d/theme.conf > /dev/null; }
-    fi
+    # sudo pacman -Sq --noconfirm --needed qt5-graphicaleffects qt5-quickcontrols qt5-svg
+    # if install_aur_pkg -q sddm-sugar-candy-git; then
+    #     [[ $k ]] && sudo sed -i '/\[Theme\]/,/^$/s/Current=.*/Current=sugar-candy/' "$k" ||
+    #     { [[ ! -s /etc/sddm.conf.d/theme.conf ]] && echo -e "[Theme]\nCurrent=sugar-candy\n# Check sugar-candy settings: https://store.kde.org/p/1312658/" | sudo tee /etc/sddm.conf.d/theme.conf > /dev/null; }
+    # elif install_aur_pkg -q sddm-theme-sugar-candy-git; then
+    #     [[ $k ]] && sudo sed -i '/\[Theme\]/,/^$/s/Current=.*/Current=Sugar-Candy/' "$k" ||
+    #     { [[ ! -s /etc/sddm.conf.d/theme.conf ]] && echo -e "[Theme]\nCurrent=Sugar-Candy\n# Check sugar-candy settings: https://store.kde.org/p/1312658/" | sudo tee /etc/sddm.conf.d/theme.conf > /dev/null; }
+    # fi
 
     [[ -s /etc/sddm.conf.d/users.conf ]] || echo -e "[Users]\nHideShells=/usr/bin/nologin,/sbin/nologin,/bin/false,/usr/bin/git-shell" | sudo tee /etc/sddm.conf.d/users.conf > /dev/null
     [[ -s /etc/sddm.conf.d/avatar.conf ]] || echo -e "[Theme]\nEnableAvatars=false" | sudo tee /etc/sddm.conf.d/avatar.conf > /dev/null
     [[ -s /etc/sddm.conf.d/general.conf ]] || echo -e "[General]\nNumlock=on" | sudo tee /etc/sddm.conf.d/general.conf > /dev/null
     if systemd-detect-virt -q; then
-        grep -qG "^DisplayServer=" /etc/sddm.conf.d/general.conf || echo -e "# Set default to X11 (not wayland)\nDisplayServer=X11" | sudo tee -a /etc/sddm.conf.d/general.conf > /dev/null
-        grep -qG "^DisplayCommand=" /etc/sddm.conf.d/general.conf || echo -e "DisplayCommand=\"xrandr --output $(xrandr -q | awk 'NR<6 && $2=="connected" {d=$1} END {print d?d:"Virtual-1"}') --mode $VIRT_RESOLUTION\"" | sudo tee -a /etc/sddm.conf.d/general.conf > /dev/null
-        [[ $k ]] && { grep -q "^ScreenWidth=" "$k" || sudo sed -i "/\[General\]/a ScreenWidth=\"${VIRT_RESOLUTION%x*}\"\nScreenHeight=\"${VIRT_RESOLUTION#*x}\""; } ||
-        { [[ -s /etc/sddm.conf.d/theme.conf ]] && ! grep -q "^ScreenWidth=" /etc/sddm.conf.d/theme.conf && echo -e "\n[General]\nScreenWidth=\"${VIRT_RESOLUTION%x*}\"\nScreenHeight=\"${VIRT_RESOLUTION#*x}\"" | sudo tee -a /etc/sddm.conf.d/theme.conf > /dev/null; }
+        # grep -qG "^DisplayServer=" /etc/sddm.conf.d/general.conf || echo -e "# Set default to X11 (not wayland)\nDisplayServer=X11" | sudo tee -a /etc/sddm.conf.d/general.conf > /dev/null
+        # grep -qG "^DisplayCommand=" /etc/sddm.conf.d/general.conf || echo -e "DisplayCommand=\"xrandr --output $(xrandr -q | awk 'NR<6 && $2=="connected" {d=$1} END {print d?d:"Virtual-1"}') --mode $VIRT_RESOLUTION\"" | sudo tee -a /etc/sddm.conf.d/general.conf > /dev/null
+        # [[ $k ]] && { grep -q "^ScreenWidth=" "$k" || sudo sed -i "/\[General\]/a ScreenWidth=\"${VIRT_RESOLUTION%x*}\"\nScreenHeight=\"${VIRT_RESOLUTION#*x}\""; } ||
+        # { [[ -s /etc/sddm.conf.d/theme.conf ]] && ! grep -q "^ScreenWidth=" /etc/sddm.conf.d/theme.conf && echo -e "\n[General]\nScreenWidth=\"${VIRT_RESOLUTION%x*}\"\nScreenHeight=\"${VIRT_RESOLUTION#*x}\"" | sudo tee -a /etc/sddm.conf.d/theme.conf > /dev/null; }
+        echo
     else
         [[ -s /etc/sddm.conf.d/hidpi.conf ]] || echo -e "[Wayland]\nEnableHiDPI=true\n\n[X11]\nEnableHiDPI=true" | sudo tee /etc/sddm.conf.d/hidpi.conf > /dev/null
     fi
